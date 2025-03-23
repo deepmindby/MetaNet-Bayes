@@ -121,7 +121,7 @@ def parse_arguments():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=2,
+        default=20,
     )
     parser.add_argument(
         "--load",
@@ -224,7 +224,7 @@ def parse_arguments():
     parser.add_argument(
         "--top_k_ratio",
         type=float,
-        default=0.1,  # 0.05
+        default=0.05,  # 0.05
         help="Ratio of parameter blocks to select for intervention (default: 10%)"
     )
 
