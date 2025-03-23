@@ -1,12 +1,11 @@
 """
-Enhanced Batch Feature Extraction with Progressive Timeout and Memory Management
+Batch Feature Extraction with Progressive Timeout and Memory Management
 
-This script provides a more robust approach to feature extraction by:
+This script provides a robust approach to feature extraction by:
 1. Implementing batch-level timeouts
 2. Adding detailed progress monitoring
 3. Aggressively managing memory
-4. Using progressive timeouts
-5. Providing detailed diagnostics
+4. Supporting GPU device selection with automatic fallback
 
 Usage:
     python precompute_features_batch.py --model ViT-B-32 --dataset SVHN --gpu-id 0
@@ -17,12 +16,10 @@ import sys
 import torch
 import argparse
 import traceback
-import threading
 import time
 import psutil
 import gc
 import signal
-import numpy as np
 from datetime import datetime
 from tqdm import tqdm
 from src.modeling import ImageEncoder
@@ -34,21 +31,17 @@ processing_start_time = None
 last_activity_time = None
 STALL_THRESHOLD = 120  # Consider process stalled if no activity for 2 minutes
 enable_verbose = False
-exit_event = threading.Event()
-
 
 def log_info(message):
     """Print logs with timestamp"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}", flush=True)
 
-
 def log_debug(message):
     """Print debug logs only if verbose mode is enabled"""
     if enable_verbose:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{timestamp}] DEBUG: {message}", flush=True)
-
 
 def memory_cleanup(force_gc=False):
     """Aggressive memory cleanup"""
@@ -65,44 +58,6 @@ def memory_cleanup(force_gc=False):
         if torch.cuda.is_available():
             log_debug(f"GPU memory: {torch.cuda.memory_allocated() / (1024 ** 3):.2f} GB allocated, "
                       f"{torch.cuda.memory_reserved() / (1024 ** 3):.2f} GB reserved")
-
-
-def progress_monitor(dataset_name):
-    """Thread to monitor progress and detect stalls"""
-    global last_activity_time
-
-    last_activity_time = time.time()
-    last_batch = 0
-
-    while not exit_event.is_set():
-        time.sleep(10)  # Check every 10 seconds
-
-        # If batch number hasn't changed in STALL_THRESHOLD seconds, we might be stalled
-        if current_batch == last_batch:
-            time_since_last_activity = time.time() - last_activity_time
-            if time_since_last_activity > STALL_THRESHOLD:
-                log_info(f"WARNING: Process appears stalled on dataset {dataset_name}, "
-                         f"batch {current_batch} for {time_since_last_activity:.1f} seconds")
-
-                # Dump stack traces for all threads
-                if enable_verbose:
-                    log_debug("Stack traces for all threads:")
-                    for thread_id, frame in sys._current_frames().items():
-                        log_debug(f"Thread {thread_id}:")
-                        log_debug(''.join(traceback.format_stack(frame)))
-        else:
-            # Batch changed, update monitoring variables
-            last_batch = current_batch
-            last_activity_time = time.time()
-
-            # Log progress
-            elapsed = time.time() - processing_start_time
-            log_info(f"Processing: Batch {current_batch}, "
-                     f"Elapsed: {elapsed:.1f}s")
-
-            # Perform light memory cleanup
-            memory_cleanup(force_gc=False)
-
 
 def extract_features_safely(model, loader, features_path, labels_path, batch_timeout=30):
     """
@@ -124,7 +79,7 @@ def extract_features_safely(model, loader, features_path, labels_path, batch_tim
     all_features = []
     all_labels = []
 
-    # Start monitoring thread
+    # Start monitoring
     processing_start_time = time.time()
 
     log_info(f"Starting feature extraction with {len(loader)} batches")
@@ -138,59 +93,32 @@ def extract_features_safely(model, loader, features_path, labels_path, batch_tim
 
                 batch_start = time.time()
 
-                # Create a processing flag for timeout detection
-                batch_completed = threading.Event()
+                # Handle different batch formats
+                if isinstance(batch, dict):
+                    images = batch["images"].to(device)
+                    labels = batch["labels"]
+                else:
+                    images, labels = batch
+                    images = images.to(device)
 
-                # Define batch processing in a separate thread
-                def process_batch():
-                    try:
-                        # Handle different batch formats
-                        if isinstance(batch, dict):
-                            images = batch["images"].to(device)
-                            labels = batch["labels"]
-                        else:
-                            images, labels = batch
-                            images = images.to(device)
+                # Extract features in smaller chunks if batch is large
+                chunk_size = 16  # Process in smaller chunks to reduce memory pressure
+                batch_features = []
 
-                        # Extract features in smaller chunks if batch is large
-                        chunk_size = 16  # Process in smaller chunks to reduce memory pressure
-                        batch_features = []
+                for i in range(0, images.size(0), chunk_size):
+                    chunk = images[i:i + chunk_size]
+                    chunk_features = model(chunk)
+                    batch_features.append(chunk_features.cpu())
 
-                        for i in range(0, images.size(0), chunk_size):
-                            chunk = images[i:i + chunk_size]
-                            chunk_features = model(chunk)
-                            batch_features.append(chunk_features.cpu())
+                    # Release memory immediately after each chunk
+                    torch.cuda.empty_cache()
 
-                            # Release memory immediately after each chunk
-                            torch.cuda.empty_cache()
+                # Combine chunks
+                batch_features = torch.cat(batch_features, dim=0)
 
-                        # Combine chunks
-                        batch_features = torch.cat(batch_features, dim=0)
-
-                        # Add to collection
-                        all_features.append(batch_features)
-                        all_labels.append(labels)
-
-                        batch_completed.set()
-                    except Exception as e:
-                        log_info(f"Error in batch {batch_idx}: {e}")
-                        traceback.print_exc()
-                        batch_completed.set()  # Make sure we release the wait
-
-                # Start batch processing thread
-                thread = threading.Thread(target=process_batch)
-                thread.daemon = True
-                thread.start()
-
-                # Wait for the batch to complete with timeout
-                if not batch_completed.wait(timeout=batch_timeout):
-                    log_info(f"WARNING: Batch {batch_idx} processing timed out after {batch_timeout} seconds")
-                    # We'll continue processing but log the warning
-
-                # Check if thread is still alive
-                if thread.is_alive():
-                    log_info(f"WARNING: Thread for batch {batch_idx} is still running despite timeout")
-                    # We'll continue and let it run in background
+                # Add to collection
+                all_features.append(batch_features)
+                all_labels.append(labels)
 
                 # Log the batch processing time
                 batch_time = time.time() - batch_start
@@ -261,20 +189,32 @@ def extract_features_safely(model, loader, features_path, labels_path, batch_tim
         memory_cleanup(force_gc=True)
         log_info("Feature extraction function complete")
 
-
-def process_dataset(model, dataset_name, save_dir, data_location, batch_size, batch_timeout=60):
+def extract_and_save_features(model, dataset_name, save_dir, data_location, batch_size, batch_timeout=60, gpu_id=0):
     """Process a single dataset with robust error handling"""
-    global exit_event
+    global processing_start_time
 
     log_info(f"=== Processing {dataset_name} ===")
     start_time = time.time()
 
-    # Start monitoring thread
-    monitor_thread = threading.Thread(target=progress_monitor, args=(dataset_name,))
-    monitor_thread.daemon = True
-    monitor_thread.start()
+    # Set GPU device if available, with safety checks
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        if gpu_id >= num_gpus:
+            log_info(f"Warning: Requested GPU {gpu_id} but only {num_gpus} GPUs available. Using GPU 0 instead.")
+            gpu_id = 0
+        torch.cuda.set_device(gpu_id)
+        log_info(f"Using GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)}")
+    else:
+        log_info("Warning: CUDA not available, using CPU instead")
 
     try:
+        # Special handling for SUN397
+        if dataset_name == "SUN397":
+            log_info("Using special handling for SUN397 dataset")
+            # Reduce batch size for SUN397 to prevent memory issues
+            batch_size = max(16, batch_size // 2)
+            log_info(f"Reduced batch size to {batch_size} for SUN397")
+
         # Use validation preprocessing (no random augmentations)
         preprocess = model.val_preprocess
 
@@ -362,9 +302,6 @@ def process_dataset(model, dataset_name, save_dir, data_location, batch_size, ba
         return False
 
     finally:
-        # Signal the monitoring thread to exit
-        exit_event.set()
-
         # Final cleanup
         memory_cleanup(force_gc=True)
 
@@ -372,9 +309,8 @@ def process_dataset(model, dataset_name, save_dir, data_location, batch_size, ba
         log_info(f"Total processing time for {dataset_name}: {elapsed:.1f}s")
         log_info(f"GPU resources released after processing {dataset_name}")
 
-
 def parse_args():
-    parser = argparse.ArgumentParser(description="Robust batch feature extraction")
+    parser = argparse.ArgumentParser(description="Batch feature extraction")
     parser.add_argument("--model", type=str, default="ViT-B-32",
                         help="CLIP model to use (e.g. ViT-B-32)")
     parser.add_argument("--save-dir", type=str, default="precomputed_features",
@@ -382,7 +318,7 @@ def parse_args():
     parser.add_argument("--data-location", type=str,
                         default=os.path.expanduser("~/data"),
                         help="Root directory for datasets")
-    parser.add_argument("--batch-size", type=int, default=64,  # Reduced from 128 for stability
+    parser.add_argument("--batch-size", type=int, default=64,
                         help="Batch size for feature extraction")
     parser.add_argument("--dataset", type=str, required=True,
                         help="Dataset to process")
@@ -397,17 +333,22 @@ def parse_args():
                         help="OpenCLIP cache directory")
     return parser.parse_args()
 
-
 def main():
     global enable_verbose
 
     args = parse_args()
     enable_verbose = args.verbose
 
-    # Set GPU device
+    # Validate GPU availability
     if torch.cuda.is_available():
-        torch.cuda.set_device(args.gpu_id)
-        log_info(f"Using GPU: {torch.cuda.get_device_name(args.gpu_id)}")
+        num_gpus = torch.cuda.device_count()
+        log_info(f"Found {num_gpus} GPUs available")
+        if args.gpu_id >= num_gpus:
+            log_info(f"Warning: Requested GPU {args.gpu_id} but only {num_gpus} GPUs available. Using GPU 0 instead.")
+            args.gpu_id = 0
+    else:
+        log_info("Warning: CUDA not available, using CPU instead")
+        args.gpu_id = -1  # Use CPU
 
     # Create directory
     model_save_dir = os.path.join(args.save_dir, args.model)
@@ -430,13 +371,14 @@ def main():
     image_encoder = ImageEncoder(model_args)
 
     # Process dataset with robust error handling
-    success = process_dataset(
+    success = extract_and_save_features(
         model=image_encoder,
         dataset_name=args.dataset,
         save_dir=model_save_dir,
         data_location=args.data_location,
         batch_size=args.batch_size,
-        batch_timeout=args.batch_timeout
+        batch_timeout=args.batch_timeout,
+        gpu_id=args.gpu_id
     )
 
     if success:
@@ -445,7 +387,6 @@ def main():
     else:
         log_info(f"Failed to process {args.dataset}")
         return 1
-
 
 if __name__ == "__main__":
     try:

@@ -7,7 +7,11 @@
 SAVE_DIR="/home/haichao/zby/MetaNet-Bayes/precomputed_features"
 DATA_LOCATION="/home/haichao/zby/MetaNet-Bayes/data"
 MODEL="ViT-B-32"
-BATCH_SIZE=64  # 降低批次大小提高稳定性
+BATCH_SIZE=128  # 降低批次大小提高稳定性
+
+# 获取可用GPU数量
+GPU_COUNT=$(nvidia-smi --list-gpus | wc -l)
+echo "检测到 $GPU_COUNT 个可用GPU"
 
 # 确保保存目录存在
 mkdir -p $SAVE_DIR
@@ -28,7 +32,7 @@ TIMEOUTS=(
     ["GTSRB"]=3600
     ["MNIST"]=3600
     ["RESISC45"]=3600
-    ["SUN397"]=3600
+    ["SUN397"]=7200  # 为SUN397增加超时时间
     ["SVHN"]=3600
 )
 
@@ -41,8 +45,21 @@ BATCH_TIMEOUTS=(
     ["GTSRB"]=60
     ["MNIST"]=60
     ["RESISC45"]=60
-    ["SUN397"]=60
+    ["SUN397"]=120  # 为SUN397增加批次超时时间
     ["SVHN"]=60
+)
+
+# 为特定数据集设置批次大小
+declare -A BATCH_SIZES
+BATCH_SIZES=(
+    ["Cars"]=$BATCH_SIZE
+    ["DTD"]=$BATCH_SIZE
+    ["EuroSAT"]=$BATCH_SIZE
+    ["GTSRB"]=$BATCH_SIZE
+    ["MNIST"]=$BATCH_SIZE
+    ["RESISC45"]=$BATCH_SIZE
+    ["SUN397"]=64  # 对SUN397使用更小的批次大小
+    ["SVHN"]=$BATCH_SIZE
 )
 
 # 创建独立子进程处理每个数据集
@@ -57,21 +74,29 @@ for i in {0..7}; do
     # 设置日志文件
     LOG_FILE="${LOG_DIR}/${DATASET}_$(date +%Y%m%d_%H%M%S).log"
 
-    # 设置超时
+    # 设置超时和批量大小
     TIMEOUT=${TIMEOUTS[$DATASET]}
     BATCH_TIMEOUT=${BATCH_TIMEOUTS[$DATASET]}
+    CURR_BATCH_SIZE=${BATCH_SIZES[$DATASET]}
 
-    echo "处理数据集 $DATASET 在 GPU $i，日志: $LOG_FILE"
+    # 计算GPU ID - 如果GPU不足则循环使用
+    if [ $GPU_COUNT -gt 0 ]; then
+        GPU_ID=$((i % GPU_COUNT))
+    else
+        GPU_ID=0
+    fi
+
+    echo "处理数据集 $DATASET 在 GPU $GPU_ID，日志: $LOG_FILE"
 
     # 使用timeout命令设置整体超时，并在后台运行
     (
-        timeout $TIMEOUT python precompute_features_batch.py \
+        timeout $TIMEOUT python src/precompute_features_batch.py \
             --model $MODEL \
             --save-dir $SAVE_DIR \
             --data-location $DATA_LOCATION \
-            --batch-size $BATCH_SIZE \
+            --batch-size $CURR_BATCH_SIZE \
             --dataset $DATASET \
-            --gpu-id $i \
+            --gpu-id $GPU_ID \
             --batch-timeout $BATCH_TIMEOUT \
             --verbose > $LOG_FILE 2>&1
 
@@ -94,9 +119,11 @@ wait
 echo "所有特征计算完成！"
 echo "清理剩余资源..."
 
-# 确保释放所有GPU资源
-for i in {0..7}; do
-    CUDA_VISIBLE_DEVICES=$i nvidia-smi --gpu-reset 2>/dev/null || true
-done
+# 清理 GPU 资源 (如果有可用的GPU)
+if [ $GPU_COUNT -gt 0 ]; then
+    for i in $(seq 0 $((GPU_COUNT-1))); do
+        CUDA_VISIBLE_DEVICES=$i nvidia-smi --gpu-reset 2>/dev/null || true
+    done
+fi
 
 echo "清理完成！"

@@ -172,24 +172,49 @@ def get_dataset(dataset_name, preprocess, location, batch_size=128, num_workers=
             # Extract the actual dataset name
             base_dataset_name = dataset_name[len('precomputed_'):]
 
-            # Try to determine feature directory
-            model_name = "ViT-B-32"  # Default model name
-            # Try to extract model name if in format "model_name.dataset_name"
-            if "." in base_dataset_name:
-                model_name, base_dataset_name = base_dataset_name.split(".", 1)
+            # Try various paths for SUN397
+            possible_sun397_paths = [
+                os.path.join(location, "precomputed_features", "ViT-B-32", "SUN397"),
+                os.path.join(location, "precomputed_features", "ViT-B-32", "SUN397Val"),
+                os.path.join(location, "precomputed_features", "SUN397"),
+                os.path.join(location, "SUN397"),
+                os.path.join(location, "features", "SUN397"),
+            ]
 
-            # Construct path to precomputed features
-            feature_dir = os.path.join(location, 'precomputed_features', model_name, base_dataset_name)
+            # Try each path
+            for path in possible_sun397_paths:
+                print(f"Trying SUN397 path: {path}")
+                if os.path.exists(path):
+                    try:
+                        return SUN397FixedFeatures(
+                            feature_dir=path,
+                            preprocess=preprocess,
+                            location=location,
+                            batch_size=batch_size,
+                            num_workers=num_workers
+                        )
+                    except Exception as e:
+                        print(f"Error with SUN397 path {path}: {e}")
+                        continue
 
-            if os.path.exists(feature_dir):
-                print(f"Loading SUN397 features from {feature_dir}")
-                return SUN397FixedFeatures(
-                    feature_dir=feature_dir,
-                    preprocess=preprocess,
-                    location=location,
-                    batch_size=batch_size,
-                    num_workers=num_workers
-                )
+            # If no path works, try a recursive search
+            print("Searching recursively for SUN397 features...")
+            for root, dirs, files in os.walk(location):
+                if "SUN397" in root and any(f.endswith(".pt") for f in files):
+                    print(f"Found potential SUN397 directory: {root}")
+                    try:
+                        return SUN397FixedFeatures(
+                            feature_dir=root,
+                            preprocess=preprocess,
+                            location=location,
+                            batch_size=batch_size,
+                            num_workers=num_workers
+                        )
+                    except Exception as e:
+                        print(f"Error with SUN397 path {root}: {e}")
+                        continue
+        except ImportError:
+            print("SUN397FixedFeatures not available, falling back to standard methods")
         except Exception as e:
             print(f"Error loading SUN397 with FixedFeatures: {e}")
             import traceback
@@ -201,20 +226,27 @@ def get_dataset(dataset_name, preprocess, location, batch_size=128, num_workers=
         # Extract the actual dataset name
         base_dataset_name = dataset_name[len('precomputed_'):]
 
-        # Construct path to precomputed features
-        feature_dir = os.path.join(location, 'precomputed_features', base_dataset_name)
+        # Try various path structures
+        possible_paths = [
+            os.path.join(location, 'precomputed_features', "ViT-B-32", base_dataset_name),
+            os.path.join(location, 'precomputed_features', base_dataset_name),
+            os.path.join(location, base_dataset_name),
+            os.path.join(location, 'features', base_dataset_name)
+        ]
 
-        if os.path.exists(feature_dir):
-            from src.datasets.precomputed_features import PrecomputedFeatures
-            return PrecomputedFeatures(
-                feature_dir=feature_dir,
-                preprocess=preprocess,
-                location=location,
-                batch_size=batch_size,
-                num_workers=num_workers
-            )
-        else:
-            raise ValueError(f"Precomputed features not found at {feature_dir}")
+        for feature_dir in possible_paths:
+            if os.path.exists(feature_dir):
+                from src.datasets.precomputed_features import PrecomputedFeatures
+                print(f"Found precomputed features at: {feature_dir}")
+                return PrecomputedFeatures(
+                    feature_dir=feature_dir,
+                    preprocess=preprocess,
+                    location=location,
+                    batch_size=batch_size,
+                    num_workers=num_workers
+                )
+
+        raise ValueError(f"Precomputed features not found for {base_dataset_name}")
 
     cls_idx = None
     if '_' in dataset_name:

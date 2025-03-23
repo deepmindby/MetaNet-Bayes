@@ -15,6 +15,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from torch.cuda.amp import GradScaler
 import gc
+import sys
 
 from src.metanet_precomputed import PrecomputedMetaNet
 from src.utils import cosine_lr
@@ -70,14 +71,34 @@ def lp_reg(x, p=None, gamma=0.5) -> torch.Tensor:
     return 0 if p is None else gamma * torch.norm(x, p=p, dim=0).mean()
 
 
-def plot_training_curves(train_losses, val_accuracies, dataset_name, save_dir):
-    """Plot and save training curves"""
+def plot_training_curves(train_losses, val_accuracies, dataset_name, save_dir, config=None):
+    """Plot and save training curves
+
+    Args:
+        train_losses: List of loss values
+        val_accuracies: List of validation accuracy values
+        dataset_name: Name of the dataset
+        save_dir: Directory to save the plot
+        config: Optional configuration dictionary with model settings
+    """
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12), sharex=True)
 
     # Plot losses
     ax1.plot(train_losses, 'r-')
     ax1.set_ylabel('Loss')
-    ax1.set_title(f'Training Loss for {dataset_name}')
+
+    # Add configuration to title if available
+    if config:
+        model_type = "Standard"
+        if config.get('blockwise', False):
+            model_type = "Blockwise"
+        if config.get('causal', False):
+            model_type = f"Causal ({config.get('top_k_ratio', 0.1)})"
+        title = f'{model_type} Model Training Loss for {dataset_name}'
+    else:
+        title = f'Training Loss for {dataset_name}'
+
+    ax1.set_title(title)
     ax1.grid(True)
 
     # Plot accuracies
@@ -90,90 +111,325 @@ def plot_training_curves(train_losses, val_accuracies, dataset_name, save_dir):
 
     plt.tight_layout()
     os.makedirs(save_dir, exist_ok=True)
-    plt.savefig(os.path.join(save_dir, f'{dataset_name}_training_curves.png'))
+
+    # Add configuration to filename
+    filename_suffix = ""
+    if config:
+        if config.get('blockwise', False):
+            filename_suffix += "_blockwise"
+        if config.get('causal', False):
+            filename_suffix += "_causal"
+
+    plt.savefig(os.path.join(save_dir, f'{dataset_name}{filename_suffix}_training_curves.png'))
     plt.close()
 
 
-def get_precomputed_dataset(dataset_name, model_name, location, batch_size=128, num_workers=8):
-    """Get dataset with pre-computed features
+class PrecomputedFeatureDataset(torch.utils.data.Dataset):
+    """Dataset for precomputed features with minimal logging"""
+
+    def __init__(self, features_path, labels_path, verbose=False):
+        """Initialize with paths to features and labels
+
+        Args:
+            features_path: Path to features tensor
+            labels_path: Path to labels tensor
+            verbose: Whether to print detailed logs
+        """
+        super().__init__()
+
+        # Load features and labels
+        if verbose:
+            print(f"Loading features from {features_path}")
+        self.features = torch.load(features_path)
+
+        if verbose:
+            print(f"Loading labels from {labels_path}")
+        self.labels = torch.load(labels_path)
+
+        if len(self.features) != len(self.labels):
+            raise ValueError(f"Features ({len(self.features)}) and labels ({len(self.labels)}) count mismatch")
+
+        if verbose:
+            print(f"Loaded {len(self.features)} samples with feature dim {self.features.shape[1]}")
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        return {
+            "features": self.features[idx],
+            "labels": self.labels[idx],
+            "index": idx
+        }
+
+
+def get_precomputed_dataset(dataset_name, model_name, location, batch_size=128, num_workers=2, verbose=False):
+    """Get dataset with pre-computed features with more robust path handling
 
     Args:
-        dataset_name: Name of the dataset (without 'precomputed_' prefix)
+        dataset_name: Name of the dataset
         model_name: Name of the model used for feature extraction
         location: Root data directory
         batch_size: Batch size for dataloaders
-        num_workers: Number of worker threads
+        num_workers: Number of worker threads (will be limited for safety)
+        verbose: Whether to print detailed logs
 
     Returns:
         dataset: Dataset with pre-computed features
     """
-    # Special handling for SUN397
-    if "SUN397" in dataset_name:
-        try:
-            from src.datasets.sun397_fix import SUN397FixedFeatures
-
-            # Try various paths for SUN397
-            possible_sun397_paths = [
-                os.path.join(location, "precomputed_features", model_name, "SUN397"),
-                os.path.join(location, "precomputed_features", model_name, "SUN397Val"),
-                os.path.join(location, "precomputed_features", "SUN397"),
-                os.path.join(location, model_name, "SUN397"),
-                os.path.join(location, "features", "SUN397"),
-            ]
-
-            # Try each path
-            for path in possible_sun397_paths:
-                if os.path.exists(path):
-                    try:
-                        return SUN397FixedFeatures(
-                            feature_dir=path,
-                            batch_size=batch_size,
-                            num_workers=num_workers
-                        )
-                    except Exception as e:
-                        print(f"Error with SUN397 path {path}: {e}")
-                        continue
-        except ImportError:
-            print("SUN397FixedFeatures not available, falling back to standard methods")
-
-    # Import here to avoid circular imports
-    from src.datasets.precomputed_features import PrecomputedFeatures
-
     # Clean dataset name if it has "precomputed_" prefix
     if dataset_name.startswith("precomputed_"):
         dataset_name = dataset_name[len("precomputed_"):]
 
-    # Build feature directory path - Look directly in precomputed_features
-    feature_dir = os.path.join(location, "precomputed_features", model_name, dataset_name)
+    # Handle the case where dataset ends with "Val"
+    base_name = dataset_name
+    if dataset_name.endswith("Val"):
+        base_name = dataset_name[:-3]
 
-    # Check if features exist
-    if not os.path.exists(feature_dir):
-        raise FileNotFoundError(f"Pre-computed features not found at {feature_dir}")
+    # Try with common paths - now with more path variations
+    possible_paths = [
+        # With model name
+        os.path.join(location, "precomputed_features", model_name, dataset_name),
+        os.path.join(location, "precomputed_features", model_name, base_name),
+        os.path.join(location, "precomputed_features", model_name, base_name + "Val"),
+        # Without model name
+        os.path.join(location, "precomputed_features", dataset_name),
+        os.path.join(location, "precomputed_features", base_name),
+        os.path.join(location, "precomputed_features", base_name + "Val"),
+        # Other common locations
+        os.path.join(location, dataset_name),
+        os.path.join(location, base_name),
+        os.path.join(location, base_name + "Val"),
+    ]
 
-    # Limit workers to avoid resource issues
-    safe_num_workers = min(4, num_workers)
+    # Special case for SUN397
+    if "SUN397" in dataset_name:
+        sun_paths = [
+            os.path.join(location, "precomputed_features", "SUN397"),
+            os.path.join(location, "SUN397"),
+            os.path.join(location, "precomputed_features", model_name, "SUN397"),
+            os.path.join(location, "precomputed_features", "SUN397Val"),
+        ]
+        possible_paths = sun_paths + possible_paths
 
-    # Create and return dataset
-    return PrecomputedFeatures(
-        feature_dir=feature_dir,
-        batch_size=batch_size,
-        num_workers=safe_num_workers,
-        persistent_workers=False
-    )
+    # If we're in MetaNet-Bayes/MetaNet-Bayes, fix the redundant path
+    for i, path in enumerate(possible_paths):
+        if "MetaNet-Bayes/MetaNet-Bayes" in path:
+            possible_paths[i] = path.replace("MetaNet-Bayes/MetaNet-Bayes", "MetaNet-Bayes")
+
+    if verbose and is_main_process():
+        print(f"Looking for features for {dataset_name} in {len(possible_paths)} locations")
+
+    # Try each possible path
+    for path in possible_paths:
+        if os.path.exists(path):
+            if verbose and is_main_process():
+                print(f"Found directory at: {path}")
+
+            # Now check for different feature file patterns
+            feature_patterns = [
+                ("train_features.pt", "train_labels.pt"),
+                ("features.pt", "labels.pt"),
+                (os.path.join("train", "features.pt"), os.path.join("train", "labels.pt")),
+            ]
+
+            for feat_file, label_file in feature_patterns:
+                train_feat_path = os.path.join(path, feat_file)
+                train_label_path = os.path.join(path, label_file)
+
+                if os.path.exists(train_feat_path) and os.path.exists(train_label_path):
+                    if verbose and is_main_process():
+                        print(f"Found feature files: {train_feat_path} and {train_label_path}")
+
+                    # Now look for validation/test features
+                    val_patterns = [
+                        ("val_features.pt", "val_labels.pt"),
+                        ("test_features.pt", "test_labels.pt"),
+                        (os.path.join("val", "features.pt"), os.path.join("val", "labels.pt")),
+                        (os.path.join("test", "features.pt"), os.path.join("test", "labels.pt")),
+                    ]
+
+                    for val_feat_file, val_label_file in val_patterns:
+                        val_feat_path = os.path.join(path, val_feat_file)
+                        val_label_path = os.path.join(path, val_label_file)
+
+                        if os.path.exists(val_feat_path) and os.path.exists(val_label_path):
+                            if verbose and is_main_process():
+                                print(f"Found validation files: {val_feat_path} and {val_label_path}")
+
+                            # Create dataset with the found files
+                            try:
+                                # Create our custom dataset container
+                                train_dataset = PrecomputedFeatureDataset(
+                                    train_feat_path, train_label_path, verbose=verbose and is_main_process()
+                                )
+
+                                val_dataset = PrecomputedFeatureDataset(
+                                    val_feat_path, val_label_path, verbose=verbose and is_main_process()
+                                )
+
+                                # Create data loaders
+                                train_loader = torch.utils.data.DataLoader(
+                                    train_dataset,
+                                    batch_size=batch_size,
+                                    shuffle=True,
+                                    num_workers=min(num_workers, 2),
+                                    pin_memory=True,
+                                    timeout=60
+                                )
+
+                                val_loader = torch.utils.data.DataLoader(
+                                    val_dataset,
+                                    batch_size=batch_size,
+                                    shuffle=False,
+                                    num_workers=min(num_workers, 2),
+                                    pin_memory=True,
+                                    timeout=60
+                                )
+
+                                # Load classnames
+                                classnames_path = os.path.join(path, "classnames.txt")
+                                if os.path.exists(classnames_path):
+                                    with open(classnames_path, "r") as f:
+                                        classnames = [line.strip() for line in f.readlines()]
+                                    if verbose and is_main_process():
+                                        print(f"Loaded {len(classnames)} class names")
+                                else:
+                                    # Create dummy classnames
+                                    unique_labels = torch.unique(train_dataset.labels)
+                                    classnames = [f"class_{i}" for i in range(len(unique_labels))]
+                                    if verbose and is_main_process():
+                                        print(f"Created {len(classnames)} dummy class names")
+
+                                # Create dataset container
+                                dataset = type('', (), {})()
+                                dataset.train_dataset = train_dataset
+                                dataset.train_loader = train_loader
+                                dataset.test_dataset = val_dataset
+                                dataset.test_loader = val_loader
+                                dataset.classnames = classnames
+
+                                if is_main_process():
+                                    print(f"Successfully loaded dataset from {path}")
+                                    print(f"Train: {len(train_dataset)} samples, Test: {len(val_dataset)} samples")
+
+                                return dataset
+
+                            except Exception as e:
+                                if is_main_process():
+                                    print(f"Error creating dataset from {path}: {e}")
+                                # Continue to next option
+
+    # If we get here, try a recursive search for any path containing the dataset name
+    if is_main_process():
+        print(f"Standard search failed, performing recursive search for {base_name}...")
+
+    for root, dirs, files in os.walk(location):
+        if base_name.lower() in root.lower() and any(f.endswith('.pt') for f in files):
+            if is_main_process():
+                print(f"Found potential directory: {root}")
+
+            pt_files = [f for f in files if f.endswith('.pt')]
+            if is_main_process():
+                print(f"Found PT files: {pt_files}")
+
+            # Try to guess train/test patterns from file names
+            train_feat = None
+            train_label = None
+            val_feat = None
+            val_label = None
+
+            for f in pt_files:
+                if 'train' in f.lower() and 'feature' in f.lower():
+                    train_feat = os.path.join(root, f)
+                elif 'train' in f.lower() and 'label' in f.lower():
+                    train_label = os.path.join(root, f)
+                elif ('val' in f.lower() or 'test' in f.lower()) and 'feature' in f.lower():
+                    val_feat = os.path.join(root, f)
+                elif ('val' in f.lower() or 'test' in f.lower()) and 'label' in f.lower():
+                    val_label = os.path.join(root, f)
+
+            # If we found at least train features and labels
+            if train_feat and train_label:
+                # Use the same files for val if not found
+                if not val_feat:
+                    val_feat = train_feat
+                if not val_label:
+                    val_label = train_label
+
+                if is_main_process():
+                    print(f"Using train: {train_feat}, {train_label}")
+                    print(f"Using val: {val_feat}, {val_label}")
+
+                try:
+                    # Create our custom dataset container
+                    train_dataset = PrecomputedFeatureDataset(
+                        train_feat, train_label, verbose=verbose and is_main_process()
+                    )
+
+                    val_dataset = PrecomputedFeatureDataset(
+                        val_feat, val_label, verbose=verbose and is_main_process()
+                    )
+
+                    # Create data loaders
+                    train_loader = torch.utils.data.DataLoader(
+                        train_dataset,
+                        batch_size=batch_size,
+                        shuffle=True,
+                        num_workers=min(num_workers, 2),
+                        pin_memory=True,
+                        timeout=60
+                    )
+
+                    val_loader = torch.utils.data.DataLoader(
+                        val_dataset,
+                        batch_size=batch_size,
+                        shuffle=False,
+                        num_workers=min(num_workers, 2),
+                        pin_memory=True,
+                        timeout=60
+                    )
+
+                    # Try to find classnames or create dummy ones
+                    classnames_path = os.path.join(root, "classnames.txt")
+                    if os.path.exists(classnames_path):
+                        with open(classnames_path, "r") as f:
+                            classnames = [line.strip() for line in f.readlines()]
+                    else:
+                        # Create dummy classnames
+                        unique_labels = torch.unique(train_dataset.labels)
+                        classnames = [f"class_{i}" for i in range(len(unique_labels))]
+
+                    # Create dataset container
+                    dataset = type('', (), {})()
+                    dataset.train_dataset = train_dataset
+                    dataset.train_loader = train_loader
+                    dataset.test_dataset = val_dataset
+                    dataset.test_loader = val_loader
+                    dataset.classnames = classnames
+
+                    if is_main_process():
+                        print(f"Successfully loaded dataset from {root}")
+                        print(f"Train: {len(train_dataset)} samples, Test: {len(val_dataset)} samples")
+
+                    return dataset
+                except Exception as e:
+                    if is_main_process():
+                        print(f"Error creating dataset from recursive search: {e}")
+
+    # If we get here, all paths failed
+    if is_main_process():
+        print(f"SEARCH FAILED: Attempted paths for {dataset_name}:")
+        for path in possible_paths:
+            exists = "exists" if os.path.exists(path) else "not found"
+            print(f"  - {path} ({exists})")
+
+    raise FileNotFoundError(f"Pre-computed features not found for {dataset_name}")
 
 
 def evaluate_model(model, dataset, device):
-    """Evaluate model on dataset
-
-    The model parameter can be either a model object with eval() method
-    or a callable function that processes features.
-    """
-    # Handle both model objects and callable functions
-    is_callable_fn = callable(model) and not hasattr(model, 'eval')
-
-    if not is_callable_fn:
-        model.eval()
-
+    """Evaluate model on dataset"""
+    model.eval()
     correct = 0
     total = 0
 
@@ -214,7 +470,8 @@ def cleanup_data_resources(dataset):
         dataset.train_dataset = None
         dataset.test_dataset = None
     except Exception as e:
-        print(f"Warning during dataset cleanup: {e}")
+        if is_main_process():
+            print(f"Warning during dataset cleanup: {e}")
 
     # Force garbage collection
     gc.collect()
@@ -236,65 +493,94 @@ def main(rank, args):
     else:
         datasets_to_process = ["MNIST", "SUN397", "SVHN", "EuroSAT", "GTSRB", "DTD", "Cars"]
 
-    # Ensure save directory exists
+    # Fix path logic to avoid duplicating MetaNet-Bayes
     if not hasattr(args, 'save') or args.save is None:
-        args.save = "checkpoints_precomputed"
+        # Check if we're already in MetaNet-Bayes directory
+        current_dir = os.getcwd()
+        if current_dir.endswith('MetaNet-Bayes'):
+            args.save = os.path.join(current_dir, "checkpoints_precomputed")
+        else:
+            args.save = os.path.join(current_dir, "MetaNet-Bayes", "checkpoints_precomputed")
         if rank == 0:
-            print(f"Using default save directory: {args.save}")
+            print(f"Using save directory: {args.save}")
 
     # Create save directory
-    os.makedirs(args.save, exist_ok=True)
+    if is_main_process():
+        os.makedirs(args.save, exist_ok=True)
 
     # Set default feature directory
     if not hasattr(args, 'precomputed_dir') or args.precomputed_dir is None:
-        args.precomputed_dir = os.path.join(args.data_location, "precomputed_features") \
-            if hasattr(args, 'data_location') else "precomputed_features"
+        # Check if we're already in MetaNet-Bayes directory
+        current_dir = os.getcwd()
+        if current_dir.endswith('MetaNet-Bayes'):
+            args.precomputed_dir = os.path.join(current_dir, "precomputed_features")
+        else:
+            args.precomputed_dir = os.path.join(current_dir, "MetaNet-Bayes", "precomputed_features")
 
-    # Ensure model name is set
-    if not hasattr(args, 'model'):
-        args.model = "ViT-B-32"  # Default model
-
-    # Ensure number of task vectors is set
-    if not hasattr(args, 'num_task_vectors'):
-        args.num_task_vectors = 8
+    # Print configuration only from main process
+    if rank == 0:
+        print(f"\n=== Training Configuration ===")
+        print(f"Model: {args.model}")
+        print(f"Using blockwise coefficients: {args.blockwise_coef}")
+        print(f"Using causal intervention: {args.causal_intervention}")
+        if args.causal_intervention:
+            print(f"Top-k ratio: {args.top_k_ratio}")
+            print(f"Variance penalty coefficient: {args.var_penalty_coef if hasattr(args, 'var_penalty_coef') else 0.01}")
+        print(f"Number of task vectors: {args.num_task_vectors}")
+        print(f"Batch size: {args.batch_size}")
+        print(f"Learning rate: {args.lr}")
+        print(f"Save directory: {args.save}")
+        print("=" * 30)
 
     for dataset_name in datasets_to_process:
         target_dataset = f"precomputed_{dataset_name}Val"  # Use precomputed features
-        if rank == 0:
+        if is_main_process():
             print(f"=== Training on {dataset_name} with pre-computed features ===")
 
         # Setup save directory for this dataset
         save_dir = os.path.join(args.save, dataset_name + "Val")
-        os.makedirs(save_dir, exist_ok=True)
+        if is_main_process():
+            os.makedirs(save_dir, exist_ok=True)
 
         dataset = None
 
         try:
-            # Get precomputed features for the current dataset
+            # Get precomputed features with minimal verbose output
             dataset = get_precomputed_dataset(
                 dataset_name=target_dataset,
-                model_name=args.model,  # Use original format with hyphens
+                model_name=args.model,
                 location=args.data_location if hasattr(args, 'data_location') else ".",
                 batch_size=args.batch_size,
-                num_workers=4
+                num_workers=2,  # Reduced for stability
+                verbose=True  # Enable verbose mode to debug path issues
             )
 
             # Sample feature to get dimensions
-            sample_batch = next(iter(dataset.train_loader))
-            sample_batch = maybe_dictionarize(sample_batch)
-            feature_dim = sample_batch["features"].shape[1]
-            if rank == 0:
-                print(f"Feature dimension: {feature_dim}")
+            try:
+                sample_batch = next(iter(dataset.train_loader))
+                sample_batch = maybe_dictionarize(sample_batch)
+                feature_dim = sample_batch["features"].shape[1]
+                if is_main_process():
+                    print(f"Feature dimension: {feature_dim}")
+            except Exception as e:
+                if is_main_process():
+                    print(f"Error getting feature dimension: {e}")
+                raise
 
             # Create model
-            model = PrecomputedMetaNet(
-                feature_dim=feature_dim,
-                task_vectors=args.num_task_vectors,  # Number of task vectors to simulate
-                blockwise=args.blockwise_coef if hasattr(args, 'blockwise_coef') else False,
-                enable_causal=args.causal_intervention if hasattr(args, 'causal_intervention') else False,
-                top_k_ratio=args.top_k_ratio if hasattr(args, 'top_k_ratio') else 0.1
-            )
-            model = model.cuda()
+            try:
+                model = PrecomputedMetaNet(
+                    feature_dim=feature_dim,
+                    task_vectors=args.num_task_vectors,  # Number of task vectors to simulate
+                    blockwise=args.blockwise_coef if hasattr(args, 'blockwise_coef') else False,
+                    enable_causal=args.causal_intervention if hasattr(args, 'causal_intervention') else False,
+                    top_k_ratio=args.top_k_ratio if hasattr(args, 'top_k_ratio') else 0.1
+                )
+                model = model.cuda()
+            except Exception as e:
+                if is_main_process():
+                    print(f"Error creating model: {e}")
+                raise
 
             data_loader = dataset.train_loader
             num_batches = len(data_loader)
@@ -303,38 +589,48 @@ def main(rank, args):
             print_every = max(num_batches // 10, 1)
 
             # Distributed training setup
-            ddp_loader = distribute_loader(data_loader)
-            ddp_model = torch.nn.parallel.DistributedDataParallel(
-                model,
-                device_ids=[args.rank],
-                find_unused_parameters=False
-            )
+            try:
+                ddp_loader = distribute_loader(data_loader)
+                ddp_model = torch.nn.parallel.DistributedDataParallel(
+                    model,
+                    device_ids=[args.rank],
+                    find_unused_parameters=False
+                )
 
-            # Setup classifier layer
-            num_classes = len(dataset.classnames)
-            classifier = torch.nn.Linear(feature_dim, num_classes).cuda()
+                # Setup classifier layer
+                num_classes = len(dataset.classnames)
+                classifier = torch.nn.Linear(feature_dim, num_classes).cuda()
+            except Exception as e:
+                if is_main_process():
+                    print(f"Error in distributed setup: {e}")
+                raise
 
             # Setup optimizer
-            params = list(ddp_model.parameters()) + list(classifier.parameters())
-            optimizer = torch.optim.AdamW(
-                params,
-                lr=args.lr if hasattr(args, 'lr') else 1e-3,
-                weight_decay=args.wd if hasattr(args, 'wd') else 0.01
-            )
+            try:
+                params = list(ddp_model.parameters()) + list(classifier.parameters())
+                optimizer = torch.optim.AdamW(
+                    params,
+                    lr=args.lr if hasattr(args, 'lr') else 1e-3,
+                    weight_decay=args.wd if hasattr(args, 'wd') else 0.01
+                )
 
-            # Learning rate scheduler
-            scheduler = cosine_lr(
-                optimizer,
-                args.lr if hasattr(args, 'lr') else 1e-3,
-                0,
-                args.epochs * num_batches if hasattr(args, 'epochs') else 10 * num_batches
-            )
+                # Learning rate scheduler
+                scheduler = cosine_lr(
+                    optimizer,
+                    args.lr if hasattr(args, 'lr') else 1e-3,
+                    0,
+                    args.epochs * num_batches if hasattr(args, 'epochs') else 10 * num_batches
+                )
 
-            # Loss function
-            loss_fn = torch.nn.CrossEntropyLoss()
+                # Loss function
+                loss_fn = torch.nn.CrossEntropyLoss()
 
-            # Mixed precision training
-            scaler = GradScaler()
+                # Mixed precision training
+                scaler = GradScaler()
+            except Exception as e:
+                if is_main_process():
+                    print(f"Error setting up optimizer: {e}")
+                raise
 
             # Training monitoring
             train_losses = []
@@ -358,58 +654,65 @@ def main(rank, args):
                 for i, batch in enumerate(ddp_loader):
                     start_time = time.time()
 
-                    batch = maybe_dictionarize(batch)
-                    features = batch["features"].to(rank)
-                    labels = batch["labels"].to(rank)
+                    try:
+                        batch = maybe_dictionarize(batch)
+                        features = batch["features"].to(rank)
+                        labels = batch["labels"].to(rank)
 
-                    with torch.autocast(device_type='cuda', dtype=torch.float16):
-                        # Forward pass
-                        transformed_features = ddp_model(features)
-                        logits = classifier(transformed_features)
+                        with torch.autocast(device_type='cuda', dtype=torch.float16):
+                            # Forward pass
+                            transformed_features = ddp_model(features)
+                            logits = classifier(transformed_features)
 
-                        # Task loss
-                        task_loss = loss_fn(logits, labels)
+                            # Task loss
+                            task_loss = loss_fn(logits, labels)
 
-                        # Variance loss if causal intervention is enabled
-                        if hasattr(args, 'causal_intervention') and args.causal_intervention:
-                            var_loss = ddp_model.module.compute_intervention_loss(features)
-                            var_penalty = args.var_penalty_coef if hasattr(args, 'var_penalty_coef') else 0.1
-                            total_loss = task_loss + var_penalty * var_loss
+                            # Variance loss if causal intervention is enabled
+                            if hasattr(args, 'causal_intervention') and args.causal_intervention:
+                                var_loss = ddp_model.module.compute_intervention_loss(features)
+                                var_penalty = args.var_penalty_coef if hasattr(args, 'var_penalty_coef') else 0.01
+                                total_loss = task_loss + var_penalty * var_loss
 
-                            # Record variance loss
-                            var_loss_cpu = var_loss.item()
-                            if var_loss_cpu > 0:
-                                epoch_var_loss += var_loss_cpu
-                                var_loss_count += 1
-                                if is_main_process():
-                                    var_losses.append(var_loss_cpu)
-                        else:
-                            var_loss = torch.tensor(0.0, device=features.device)
-                            var_loss_cpu = 0.0
-                            total_loss = task_loss
+                                # Record variance loss
+                                var_loss_cpu = var_loss.item()
+                                if var_loss_cpu > 0:
+                                    epoch_var_loss += var_loss_cpu
+                                    var_loss_count += 1
+                                    if is_main_process():
+                                        var_losses.append(var_loss_cpu)
+                            else:
+                                var_loss = torch.tensor(0.0, device=features.device)
+                                var_loss_cpu = 0.0
+                                total_loss = task_loss
 
-                    # Backward pass
-                    scaler.scale(total_loss).backward()
+                        # Backward pass
+                        scaler.scale(total_loss).backward()
 
-                    # Step optimizer
-                    scheduler(i + epoch * num_batches)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
+                        # Step optimizer
+                        scheduler(i + epoch * num_batches)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad()
 
-                    # Record stats
-                    task_loss_cpu = task_loss.item()
-                    batch_count += 1
-                    epoch_loss += task_loss_cpu
-                    if is_main_process():
-                        train_losses.append(task_loss_cpu)
+                        # Record stats
+                        task_loss_cpu = task_loss.item()
+                        batch_count += 1
+                        epoch_loss += task_loss_cpu
+                        if is_main_process():
+                            train_losses.append(task_loss_cpu)
 
-                    # Print progress
-                    if i % print_every == 0 and is_main_process():
-                        var_str = f", Var Loss: {var_loss_cpu:.6f}" if hasattr(args, 'causal_intervention') and args.causal_intervention else ""
-                        print(f"Epoch {epoch+1}/{num_epochs}, Batch {i}/{num_batches}, "
-                              f"Loss: {task_loss_cpu:.6f}{var_str}, "
-                              f"Time: {time.time() - start_time:.3f}s")
+                        # Print progress (less frequently)
+                        if i % print_every == 0 and is_main_process():
+                            var_str = f", Var Loss: {var_loss_cpu:.6f}" if hasattr(args, 'causal_intervention') and args.causal_intervention else ""
+                            print(f"Epoch {epoch+1}/{num_epochs}, Batch {i}/{num_batches}, "
+                                f"Loss: {task_loss_cpu:.6f}{var_str}, "
+                                f"Time: {time.time() - start_time:.3f}s")
+
+                    except Exception as e:
+                        if is_main_process():
+                            print(f"Error in training batch: {e}")
+                        # Skip this batch but continue training
+                        continue
 
                 # Record epoch stats
                 avg_epoch_loss = epoch_loss / batch_count if batch_count > 0 else 0
@@ -474,9 +777,13 @@ def main(rank, args):
 
             # Save results
             if is_main_process():
-                # Save best model with clear causal indication in filename
-                causal_suffix = "_causal" if hasattr(args, 'causal_intervention') and args.causal_intervention else ""
-                model_filename = f"best_precomputed_model{causal_suffix}.pt"
+                # Save best model with clear model type in filename
+                model_type = ""
+                if args.blockwise_coef:
+                    model_type += "_blockwise"
+                if args.causal_intervention:
+                    model_type += "_causal"
+                model_filename = f"best_precomputed_model{model_type}.pt"
 
                 if best_model_state:
                     best_model_path = os.path.join(save_dir, model_filename)
@@ -495,19 +802,25 @@ def main(rank, args):
                     'var_losses': var_losses if var_losses else [],
                     'config': config if 'config' in locals() else {}
                 }
-                with open(os.path.join(save_dir, f"precomputed_training_history{causal_suffix}.json"), 'w') as f:
+                with open(os.path.join(save_dir, f"precomputed_training_history{model_type}.json"), 'w') as f:
                     json.dump(history, f, indent=4)
 
                 # Plot training curves
                 plot_dir = os.path.join(args.save, "precomputed_plots")
-                plot_training_curves(epoch_losses, val_accuracies, f"{dataset_name}{causal_suffix}", plot_dir)
+                plot_config = {
+                    'blockwise': args.blockwise_coef,
+                    'causal': args.causal_intervention,
+                    'top_k_ratio': args.top_k_ratio if hasattr(args, 'top_k_ratio') else 0.1
+                }
+                plot_training_curves(epoch_losses, val_accuracies, dataset_name, plot_dir, plot_config)
 
                 print(f"Training completed for {dataset_name}. Best validation accuracy: {best_acc*100:.2f}%")
 
         except Exception as e:
-            print(f"Error processing dataset {dataset_name}: {e}")
-            import traceback
-            traceback.print_exc()
+            if is_main_process():
+                print(f"Error processing dataset {dataset_name}: {e}")
+                import traceback
+                traceback.print_exc()
         finally:
             # Clean up dataset resources
             cleanup_data_resources(dataset)
@@ -524,37 +837,70 @@ if __name__ == "__main__":
 
     # Set default save directory if not provided
     if not hasattr(args, 'save') or args.save is None:
-        args.save = "checkpoints_precomputed"
-        print(f"Using default save directory: {args.save}")
+        # Check if we're already in MetaNet-Bayes directory
+        current_dir = os.getcwd()
+        if current_dir.endswith('MetaNet-Bayes'):
+            args.save = os.path.join(current_dir, "checkpoints_precomputed")
+        else:
+            args.save = os.path.join(current_dir, "MetaNet-Bayes", "checkpoints_precomputed")
+        print(f"Using save directory: {args.save}")
+
+    # Fix data location to proper path
+    current_dir = os.getcwd()
+    if hasattr(args, 'data_location') and args.data_location:
+        # Remove redundant MetaNet-Bayes if present
+        if "MetaNet-Bayes/MetaNet-Bayes" in args.data_location:
+            args.data_location = args.data_location.replace("MetaNet-Bayes/MetaNet-Bayes", "MetaNet-Bayes")
+    else:
+        # Set default data location
+        if current_dir.endswith('MetaNet-Bayes'):
+            args.data_location = current_dir
+        else:
+            args.data_location = os.path.join(current_dir, "MetaNet-Bayes")
 
     # Set feature directory path
-    args.precomputed_dir = os.path.join(args.data_location, "precomputed_features") \
-        if hasattr(args, 'data_location') else "precomputed_features"
+    if current_dir.endswith('MetaNet-Bayes'):
+        args.precomputed_dir = os.path.join(current_dir, "precomputed_features")
+    else:
+        args.precomputed_dir = os.path.join(current_dir, "MetaNet-Bayes", "precomputed_features")
 
     args.num_task_vectors = 8  # Default number of task vectors to simulate
 
     # Set default training parameters if not specified
     if not hasattr(args, 'epochs') or not args.epochs:
-        args.epochs = 2
+        args.epochs = 10
     if not hasattr(args, 'batch_size') or not args.batch_size:
         args.batch_size = 128  # Can use larger batch size with precomputed features
     if not hasattr(args, 'lr') or not args.lr:
-        args.lr = 1e-2
+        args.lr = 1e-3
     if not hasattr(args, 'wd') or not args.wd:
         args.wd = 0.01
+    if not hasattr(args, 'var_penalty_coef'):
+        args.var_penalty_coef = 0.01
 
     # Set random port if not specified to avoid conflicts
     if not hasattr(args, 'port') or not args.port:
         args.port = random.randint(40000, 65000)
 
-    # Launch training
+    # Set exception handling for worker processes
+    try:
+        import torch.multiprocessing as mp
+        mp.set_sharing_strategy('file_system')  # Use file_system strategy for more reliable sharing
+    except:
+        pass
+
+    # Launch training with better error handling
     try:
         torch.multiprocessing.spawn(main, args=(args,), nprocs=args.world_size)
     except Exception as e:
         print(f"Training failed with error: {e}")
+        import traceback
         traceback.print_exc()
         # Force cleanup in case of failure
         for i in range(torch.cuda.device_count()):
             if i < args.world_size:
-                torch.cuda.set_device(i)
-                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.set_device(i)
+                    torch.cuda.empty_cache()
+                except:
+                    pass

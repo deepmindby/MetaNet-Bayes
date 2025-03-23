@@ -16,22 +16,63 @@ from collections import defaultdict
 from datetime import datetime
 
 
+class PrecomputedFeatureDataset(torch.utils.data.Dataset):
+    """Dataset for precomputed features with minimal logging"""
+
+    def __init__(self, features_path, labels_path, verbose=False):
+        """Initialize with paths to features and labels
+
+        Args:
+            features_path: Path to features tensor
+            labels_path: Path to labels tensor
+            verbose: Whether to print detailed logs
+        """
+        super().__init__()
+
+        # Load features and labels
+        if verbose:
+            print(f"Loading features from {features_path}")
+        self.features = torch.load(features_path)
+
+        if verbose:
+            print(f"Loading labels from {labels_path}")
+        self.labels = torch.load(labels_path)
+
+        if len(self.features) != len(self.labels):
+            raise ValueError(f"Features ({len(self.features)}) and labels ({len(self.labels)}) count mismatch")
+
+        if verbose:
+            print(f"Loaded {len(self.features)} samples with feature dim {self.features.shape[1]}")
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        return {
+            "features": self.features[idx],
+            "labels": self.labels[idx],
+            "index": idx
+        }
+
+
 class TestOnlyFeatures:
     """Dataset container class for test-only pre-computed features"""
 
-    def __init__(self, feature_dir, batch_size=128, num_workers=4):
+    def __init__(self, feature_dir, batch_size=128, num_workers=4, verbose=False):
         """Initialize with directory containing pre-computed features
 
         Args:
             feature_dir: Path to directory with pre-computed features
             batch_size: Batch size for dataloaders
             num_workers: Number of workers for dataloaders
+            verbose: Whether to print detailed logs
         """
         # Verify directory exists
         if not os.path.exists(feature_dir):
             raise FileNotFoundError(f"Feature directory not found: {feature_dir}")
 
-        print(f"Looking for test features in: {feature_dir}")
+        if verbose:
+            print(f"Looking for test features in: {feature_dir}")
 
         # Define possible test feature file paths with different naming conventions
         possible_test_paths = [
@@ -54,8 +95,9 @@ class TestOnlyFeatures:
             if os.path.exists(feat_path) and os.path.exists(label_path):
                 test_features_path = feat_path
                 test_labels_path = label_path
-                print(f"Found test features at: {test_features_path}")
-                print(f"Found test labels at: {test_labels_path}")
+                if verbose:
+                    print(f"Found test features at: {test_features_path}")
+                    print(f"Found test labels at: {test_labels_path}")
                 break
 
         if test_features_path is None:
@@ -63,61 +105,43 @@ class TestOnlyFeatures:
 
         # Load test features and labels
         try:
-            self.test_features = torch.load(test_features_path)
-            print(f"Successfully loaded test features, shape: {self.test_features.shape}")
+            self.test_dataset = PrecomputedFeatureDataset(
+                test_features_path,
+                test_labels_path,
+                verbose=verbose
+            )
 
-            self.test_labels = torch.load(test_labels_path)
-            print(f"Successfully loaded test labels, shape: {self.test_labels.shape}")
+            # Create test loader with safer settings
+            self.test_loader = torch.utils.data.DataLoader(
+                self.test_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=min(num_workers, 2),  # Limit workers
+                pin_memory=True,
+                drop_last=False,
+                timeout=60,  # Add timeout to prevent hangs
+            )
 
-            # Validate that features and labels have matching sizes
-            if len(self.test_features) != len(self.test_labels):
-                raise ValueError(f"Features ({len(self.test_features)}) and labels ({len(self.test_labels)}) count mismatch")
+            if verbose:
+                print(f"Created dataloader with {len(self.test_dataset)} samples")
         except Exception as e:
             print(f"Error loading test features/labels: {e}")
             traceback.print_exc()
             raise
-
-        # Create a simple dataset for the test data
-        from torch.utils.data import Dataset, DataLoader
-
-        class SimpleDataset(Dataset):
-            def __init__(self, features, labels):
-                self.features = features
-                self.labels = labels
-
-            def __len__(self):
-                return len(self.features)
-
-            def __getitem__(self, idx):
-                return {
-                    "features": self.features[idx],
-                    "labels": self.labels[idx],
-                    "index": idx
-                }
-
-        self.test_dataset = SimpleDataset(self.test_features, self.test_labels)
-
-        # Create test loader
-        self.test_loader = DataLoader(
-            self.test_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-            drop_last=False,
-        )
 
         # Load classnames if available
         classnames_path = os.path.join(feature_dir, "classnames.txt")
         if os.path.exists(classnames_path):
             with open(classnames_path, "r") as f:
                 self.classnames = [line.strip() for line in f.readlines()]
-            print(f"Loaded {len(self.classnames)} class names from {classnames_path}")
+            if verbose:
+                print(f"Loaded {len(self.classnames)} class names from {classnames_path}")
         else:
             # Create dummy classnames if file doesn't exist
-            unique_labels = torch.unique(self.test_labels)
+            unique_labels = torch.unique(self.test_dataset.labels)
             self.classnames = [f"class_{i}" for i in range(len(unique_labels))]
-            print(f"Created {len(self.classnames)} dummy class names")
+            if verbose:
+                print(f"Created {len(self.classnames)} dummy class names")
 
 
 def parse_args():
@@ -126,7 +150,7 @@ def parse_args():
     parser.add_argument("--model", type=str, default="ViT-B-32",
                         help="CLIP model used for feature extraction")
     parser.add_argument("--data-location", type=str,
-                        default=os.path.expanduser("/home/haichao/zby/MetaNet-Bayes"),
+                        default=os.path.join(os.getcwd(), "MetaNet-Bayes"),
                         help="Root directory for datasets")
     parser.add_argument("--feature-dir", type=str, default=None,
                         help="Explicit directory for precomputed features (overrides data-location)")
@@ -159,7 +183,7 @@ def parse_args():
 
 
 def get_test_dataset(dataset_name, model_name, location, batch_size=128, num_workers=4, debug=False):
-    """Get dataset with pre-computed test features only
+    """Get dataset with pre-computed test features with improved path handling
 
     Args:
         dataset_name: Name of the dataset
@@ -172,119 +196,108 @@ def get_test_dataset(dataset_name, model_name, location, batch_size=128, num_wor
     Returns:
         dataset: Dataset with pre-computed features
     """
-    try:
-        # Special handling for SUN397
-        if "SUN397" in dataset_name:
-            try:
-                from src.datasets.sun397_fix import SUN397FixedFeatures
+    # Clean dataset name if it has "precomputed_" prefix
+    if dataset_name.startswith("precomputed_"):
+        dataset_name = dataset_name[len("precomputed_"):]
 
-                # Try various paths for SUN397
-                possible_sun397_paths = [
-                    os.path.join(location, "precomputed_features", model_name, "SUN397"),
-                    os.path.join(location, "precomputed_features", model_name, "SUN397Val"),
-                    os.path.join(location, "precomputed_features", "SUN397"),
-                    os.path.join(location, model_name, "SUN397"),
-                    os.path.join(location, "features", "SUN397"),
-                ]
+    # Handle the case where dataset ends with "Val"
+    base_name = dataset_name
+    if dataset_name.endswith("Val"):
+        base_name = dataset_name[:-3]
 
-                # Try each path
-                for path in possible_sun397_paths:
-                    if debug:
-                        print(f"Trying SUN397 path: {path}")
-                    if os.path.exists(path):
-                        try:
-                            return SUN397FixedFeatures(
-                                feature_dir=path,
-                                batch_size=batch_size,
-                                num_workers=num_workers
-                            )
-                        except Exception as e:
-                            if debug:
-                                print(f"Error with SUN397 path {path}: {e}")
-                            continue
+    # Try with common paths - now with more path variations
+    possible_paths = [
+        # With model name
+        os.path.join(location, "precomputed_features", model_name, dataset_name),
+        os.path.join(location, "precomputed_features", model_name, base_name),
+        os.path.join(location, "precomputed_features", model_name, base_name + "Val"),
+        # Without model name
+        os.path.join(location, "precomputed_features", dataset_name),
+        os.path.join(location, "precomputed_features", base_name),
+        os.path.join(location, "precomputed_features", base_name + "Val"),
+        # Other common locations
+        os.path.join(location, dataset_name),
+        os.path.join(location, base_name),
+        os.path.join(location, base_name + "Val"),
+    ]
 
-                # If no path works, try a recursive search
-                print("Searching recursively for SUN397 features...")
-                for root, dirs, files in os.walk(location):
-                    if "SUN397" in root and any(f.endswith(".pt") for f in files):
-                        if debug:
-                            print(f"Found potential SUN397 directory: {root}")
-                        try:
-                            return SUN397FixedFeatures(
-                                feature_dir=root,
-                                batch_size=batch_size,
-                                num_workers=num_workers
-                            )
-                        except Exception as e:
-                            if debug:
-                                print(f"Error with SUN397 path {root}: {e}")
-                            continue
+    # Special case for SUN397
+    if "SUN397" in dataset_name:
+        sun_paths = [
+            os.path.join(location, "precomputed_features", "SUN397"),
+            os.path.join(location, "SUN397"),
+            os.path.join(location, "precomputed_features", model_name, "SUN397"),
+            os.path.join(location, "precomputed_features", "SUN397Val"),
+        ]
+        possible_paths = sun_paths + possible_paths
 
-            except ImportError:
-                if debug:
-                    print("SUN397FixedFeatures not available, falling back to standard methods")
+    # If we're in MetaNet-Bayes/MetaNet-Bayes, fix the redundant path
+    for i, path in enumerate(possible_paths):
+        if "MetaNet-Bayes/MetaNet-Bayes" in path:
+            possible_paths[i] = path.replace("MetaNet-Bayes/MetaNet-Bayes", "MetaNet-Bayes")
 
-        # Continue with regular dataset loading logic
-        # Build possible feature directory paths
-        possible_dirs = []
+    if debug:
+        print(f"Looking for features for {dataset_name} in {len(possible_paths)} locations")
 
-        # Clean dataset name if it has "precomputed_" prefix
-        clean_name = dataset_name
-        if dataset_name.startswith("precomputed_"):
-            clean_name = dataset_name[len("precomputed_"):]
-
-        # Try with and without "Val" suffix
-        for name in [clean_name, f"{clean_name}Val", clean_name.replace("Val", "")]:
-            # Try different directory structures
-            possible_dirs.extend([
-                # Standard structure: model/dataset
-                os.path.join(location, "precomputed_features", model_name, name),
-                # Flat structure directly in precomputed_features
-                os.path.join(location, "precomputed_features", name),
-                # Alternative structures
-                os.path.join(location, model_name, name),
-                os.path.join(location, "features", model_name, name),
-                os.path.join(location, "features", name),
-                # Test directory directly
-                os.path.join(location, name, "test"),
-            ])
-
-        # Try each directory
-        for feature_dir in possible_dirs:
+    # Try each possible path
+    for path in possible_paths:
+        if os.path.exists(path):
             if debug:
-                print(f"Checking directory: {feature_dir}")
+                print(f"Found directory at: {path}")
 
-            if os.path.exists(feature_dir):
+            try:
+                # Try to create test dataset
+                return TestOnlyFeatures(
+                    feature_dir=path,
+                    batch_size=batch_size,
+                    num_workers=min(num_workers, 2),  # Limit workers for safety
+                    verbose=debug
+                )
+            except FileNotFoundError:
                 if debug:
-                    print(f"Found directory at: {feature_dir}")
-                try:
-                    return TestOnlyFeatures(
-                        feature_dir=feature_dir,
-                        batch_size=batch_size,
-                        num_workers=num_workers
-                    )
-                except FileNotFoundError:
-                    if debug:
-                        print(f"No test features found in {feature_dir}")
-                    continue
-                except Exception as e:
-                    print(f"Error loading from {feature_dir}: {e}")
-                    if debug:
-                        traceback.print_exc()
-                    continue
+                    print(f"No test features found in {path}")
+                continue
+            except Exception as e:
+                print(f"Error loading from {path}: {e}")
+                if debug:
+                    traceback.print_exc()
+                continue
 
-        print(f"WARNING: Could not find test features for {dataset_name} in any expected location")
-        if debug:
-            print("Tried the following directories:")
-            for dir in possible_dirs:
-                print(f"  - {dir}")
-        return None
+    # If we get here, try a recursive search for any path containing the dataset name
+    if debug:
+        print(f"Standard search failed, performing recursive search for {base_name}...")
 
-    except Exception as e:
-        print(f"Error searching for {dataset_name} test features: {e}")
-        if debug:
-            traceback.print_exc()
-        return None
+    for root, dirs, files in os.walk(location):
+        if base_name.lower() in root.lower() and any(f.endswith('.pt') for f in files):
+            if debug:
+                print(f"Found potential directory: {root}")
+
+            pt_files = [f for f in files if f.endswith('.pt')]
+            if debug:
+                print(f"Found PT files: {pt_files}")
+
+            # Try to create test dataset
+            try:
+                return TestOnlyFeatures(
+                    feature_dir=root,
+                    batch_size=batch_size,
+                    num_workers=min(num_workers, 2),
+                    verbose=debug
+                )
+            except Exception as e:
+                if debug:
+                    print(f"Error creating dataset from {root}: {e}")
+                # Continue searching
+
+    # If we get here, all paths failed
+    print(f"WARNING: Could not find test features for {dataset_name} in any expected location")
+    if debug:
+        print("Attempted paths:")
+        for path in possible_paths:
+            exists = "exists" if os.path.exists(path) else "not found"
+            print(f"  - {path} ({exists})")
+
+    return None
 
 
 def cleanup_resources(dataset):
@@ -335,18 +348,26 @@ def find_model_path(model_dir, model_name, dataset_name, debug=False):
         # Main path options
         path_options = [
             # Standard paths
-            (model_dir, model_name, name, "best_precomputed_model.pt"),
             (model_dir, name, "best_precomputed_model.pt"),
+            (model_dir, model_name, name, "best_precomputed_model.pt"),
+            # With explicit configuration in filename
+            (model_dir, name, "best_precomputed_model_blockwise.pt"),
+            (model_dir, name, "best_precomputed_model_causal.pt"),
+            (model_dir, name, "best_precomputed_model_blockwise_causal.pt"),
+            (model_dir, model_name, name, "best_precomputed_model_blockwise.pt"),
+            (model_dir, model_name, name, "best_precomputed_model_causal.pt"),
+            (model_dir, model_name, name, "best_precomputed_model_blockwise_causal.pt"),
             # With model type directories
             (f"{model_dir}-causal", model_name, name, "best_precomputed_model.pt"),
             (f"{model_dir}-meta", model_name, name, "best_precomputed_model.pt"),
             # Alternative file names
-            (model_dir, model_name, name, "best_precomputed_model_causal.pt"),
-            (model_dir, model_name, name, "best_model.pt"),
-            (model_dir, model_name, name, "model.pt"),
             (model_dir, name, "best_model.pt"),
             (model_dir, name, "model.pt"),
+            (model_dir, model_name, name, "best_model.pt"),
+            (model_dir, model_name, name, "model.pt"),
             # Check in named subdirectories
+            (model_dir, name, "checkpoints", "best_model.pt"),
+            (model_dir, name, "weights", "best_model.pt"),
             (model_dir, model_name, name, "checkpoints", "best_model.pt"),
             (model_dir, model_name, name, "weights", "best_model.pt"),
             # Base directory with dataset name
@@ -362,6 +383,20 @@ def find_model_path(model_dir, model_name, dataset_name, debug=False):
                 if debug:
                     print(f"Found model at: {path}")
                 return path
+
+    # Try recursive search if no exact match is found
+    if debug:
+        print(f"No exact model path found, trying recursive search for {clean_name}...")
+
+    # Look for any file matching the pattern in the model directory
+    for root, dirs, files in os.walk(model_dir):
+        if clean_name.lower() in root.lower():
+            for file in files:
+                if file.endswith('.pt') and ('model' in file.lower() or 'best' in file.lower()):
+                    model_path = os.path.join(root, file)
+                    if debug:
+                        print(f"Found potential model file: {model_path}")
+                    return model_path
 
     # If no paths are found, print all tried paths and raise an error
     if debug:
@@ -680,8 +715,12 @@ def evaluate_model(model_path, dataset, device, debug=False):
 
     # Determine model type from path
     model_type = "STANDARD"
+    if "blockwise" in model_path.lower() or blockwise:
+        model_type = "BLOCKWISE"
     if "causal" in model_path.lower() or enable_causal:
         model_type = "CAUSAL"
+    if ("blockwise" in model_path.lower() or blockwise) and ("causal" in model_path.lower() or enable_causal):
+        model_type = "BLOCKWISE_CAUSAL"
 
     # Compile complete results
     results = {
@@ -718,8 +757,40 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Create results directory
-    os.makedirs(args.save_dir, exist_ok=True)
+    # Fix path issues - remove redundant MetaNet-Bayes in path
+    save_dir = os.path.join(os.getcwd(), "results")
+    if save_dir.endswith("MetaNet-Bayes/MetaNet-Bayes/results"):
+        save_dir = save_dir.replace("MetaNet-Bayes/MetaNet-Bayes", "MetaNet-Bayes")
+
+    os.makedirs(save_dir, exist_ok=True)
+    print(f"Results will be saved to: {save_dir}")
+
+    # Fix model directory path - remove redundant MetaNet-Bayes
+    model_dir = os.path.join(os.getcwd(), args.model_dir)
+    if "MetaNet-Bayes/MetaNet-Bayes" in model_dir:
+        model_dir = model_dir.replace("MetaNet-Bayes/MetaNet-Bayes", "MetaNet-Bayes")
+
+    print(f"Looking for models in: {model_dir}")
+
+    # Fix data location path
+    data_location = os.path.join(os.getcwd())
+    if data_location.endswith("MetaNet-Bayes"):
+        # We're already in the MetaNet-Bayes directory
+        data_location = data_location
+    elif not "MetaNet-Bayes" in data_location:
+        # Add MetaNet-Bayes if needed
+        data_location = os.path.join(data_location, "MetaNet-Bayes")
+
+    # Make sure we don't have redundant MetaNet-Bayes
+    if "MetaNet-Bayes/MetaNet-Bayes" in data_location:
+        data_location = data_location.replace("MetaNet-Bayes/MetaNet-Bayes", "MetaNet-Bayes")
+
+    print(f"Looking for data in: {data_location}")
+
+    # Update args with fixed paths
+    args.save_dir = save_dir
+    args.model_dir = model_dir
+    args.data_location = data_location
 
     # Generate a descriptive suffix for results based on configuration
     config_suffix = "_test_only"
@@ -758,7 +829,8 @@ def main():
                 dataset = TestOnlyFeatures(
                     feature_dir=feature_dir,
                     batch_size=args.batch_size,
-                    num_workers=args.num_workers
+                    num_workers=args.num_workers,
+                    verbose=args.debug
                 )
             else:
                 # Otherwise search for features
