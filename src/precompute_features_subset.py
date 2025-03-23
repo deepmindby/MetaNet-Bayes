@@ -11,6 +11,7 @@ import time
 from datetime import datetime
 import gc
 import sys
+import traceback
 from src.modeling import ImageEncoder
 from src.datasets.registry import get_dataset
 
@@ -26,9 +27,10 @@ def timeout_handler(signum, frame):
     print(f"ERROR: Operation on dataset {current_dataset} timed out after {elapsed:.1f} seconds")
     # Force cleanup and exit
     torch.cuda.empty_cache()
+    torch.cuda.synchronize()  # Ensure all CUDA operations are completed
     gc.collect()
     # Exit with error code to ensure process termination
-    sys.exit(1)
+    os._exit(1)  # Use os._exit for stronger termination
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Precompute features for dataset subset")
@@ -125,12 +127,13 @@ def extract_and_save_features(model, dataset_name, save_dir, data_location, batc
 
     except Exception as e:
         print(f"ERROR processing dataset {dataset_name}: {e}")
-        # Don't exit here, cleanup in finally block
+        traceback.print_exc()
     finally:
         # Cancel timeout alarm
         signal.alarm(0)
         # Force clean GPU memory
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()  # Make sure all CUDA operations are complete
         gc.collect()
         print(f"GPU resources released after processing {dataset_name}")
         # Flush output to ensure logs are displayed
@@ -182,11 +185,13 @@ def extract_features_from_loader(model, loader, features_path, labels_path):
 
     except Exception as e:
         print(f"ERROR extracting features: {e}")
+        traceback.print_exc()
     finally:
         # Ensure memory is released
         all_features = None
         all_labels = None
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()
         gc.collect()
 
 def main():
@@ -199,9 +204,9 @@ def main():
     # Parse datasets to process
     datasets = [d.strip() for d in args.datasets.split(",")]
 
-    # Create directory with model name
-    model_name_safe = args.model.replace("-", "_").replace("/", "_")
-    model_save_dir = os.path.join(args.save_dir, model_name_safe)
+    # Create directory with model name - IMPORTANT: Use original model name
+    # Don't replace hyphens with underscores
+    model_save_dir = os.path.join(args.save_dir, args.model)
 
     print(f"Features will be saved to: {model_save_dir}")
     os.makedirs(model_save_dir, exist_ok=True)
@@ -238,6 +243,7 @@ def main():
                 )
             except Exception as e:
                 print(f"ERROR processing dataset {dataset_name}: {e}")
+                traceback.print_exc()
                 # Continue to next dataset
                 continue
 
@@ -245,19 +251,24 @@ def main():
 
     except Exception as e:
         print(f"ERROR in main process: {e}")
+        traceback.print_exc()
     finally:
         # Ensure resources are released
         print("Cleaning up resources...")
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()  # Ensure all CUDA operations complete
         gc.collect()
-        print("Done.")
-        # Force exit to ensure the process terminates
-        sys.exit(0)
+        print("Done. Forcing exit...")
+        # Force exit to ensure the process terminates completely
+        os._exit(0)  # Use os._exit instead of sys.exit for stronger termination
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
         print(f"Unhandled exception: {e}")
+        traceback.print_exc()
         torch.cuda.empty_cache()
-        sys.exit(1)
+        torch.cuda.synchronize()
+        gc.collect()
+        os._exit(1)

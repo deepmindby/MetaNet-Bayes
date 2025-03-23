@@ -14,10 +14,10 @@ import socket
 import numpy as np
 import matplotlib.pyplot as plt
 from torch.cuda.amp import GradScaler
+import gc
 
 from src.metanet_precomputed import PrecomputedMetaNet
 from src.utils import cosine_lr
-from src.datasets.registry_extension import get_precomputed_dataset
 from src.datasets.common import maybe_dictionarize
 from src.distributed import cleanup_ddp, distribute_loader, is_main_process, setup_ddp
 
@@ -34,7 +34,6 @@ def setup_ddp_robust(rank, world_size, port=None, max_retries=5):
     # Generate random port if not specified
     if port is None:
         port = random.randint(40000, 65000)
-        print(f"Process {rank}: Generated random port {port}")
 
     for retry in range(max_retries):
         try:
@@ -43,8 +42,6 @@ def setup_ddp_robust(rank, world_size, port=None, max_retries=5):
 
             os.environ["MASTER_ADDR"] = "localhost"
             os.environ["MASTER_PORT"] = str(current_port)
-
-            print(f"Process {rank}: Attempting to initialize with port {current_port}")
 
             torch.distributed.init_process_group(
                 "nccl",
@@ -55,7 +52,8 @@ def setup_ddp_robust(rank, world_size, port=None, max_retries=5):
             torch.cuda.set_device(rank)
             torch.distributed.barrier()
 
-            print(f"Process {rank}: Successfully initialized distributed setup with port {current_port}")
+            if rank == 0:
+                print(f"Successfully initialized distributed setup with {world_size} processes")
             return True
 
         except Exception as e:
@@ -96,9 +94,57 @@ def plot_training_curves(train_losses, val_accuracies, dataset_name, save_dir):
     plt.close()
 
 
+def get_precomputed_dataset(dataset_name, model_name, location, batch_size=128, num_workers=8):
+    """Get dataset with pre-computed features
+
+    Args:
+        dataset_name: Name of the dataset (without 'precomputed_' prefix)
+        model_name: Name of the model used for feature extraction
+        location: Root data directory
+        batch_size: Batch size for dataloaders
+        num_workers: Number of worker threads
+
+    Returns:
+        dataset: Dataset with pre-computed features
+    """
+    # Import here to avoid circular imports
+    from src.datasets.precomputed_features import PrecomputedFeatures
+
+    # Clean dataset name if it has "precomputed_" prefix
+    if dataset_name.startswith("precomputed_"):
+        dataset_name = dataset_name[len("precomputed_"):]
+
+    # Build feature directory path - Look directly in precomputed_features
+    feature_dir = os.path.join(location, "precomputed_features", model_name, dataset_name)
+
+    # Check if features exist
+    if not os.path.exists(feature_dir):
+        raise FileNotFoundError(f"Pre-computed features not found at {feature_dir}")
+
+    # Limit workers to avoid resource issues
+    safe_num_workers = min(4, num_workers)
+
+    # Create and return dataset
+    return PrecomputedFeatures(
+        feature_dir=feature_dir,
+        batch_size=batch_size,
+        num_workers=safe_num_workers,
+        persistent_workers=False
+    )
+
+
 def evaluate_model(model, dataset, device):
-    """Evaluate model on dataset"""
-    model.eval()
+    """Evaluate model on dataset
+
+    The model parameter can be either a model object with eval() method
+    or a callable function that processes features.
+    """
+    # Handle both model objects and callable functions
+    is_callable_fn = callable(model) and not hasattr(model, 'eval')
+
+    if not is_callable_fn:
+        model.eval()
+
     correct = 0
     total = 0
 
@@ -119,6 +165,33 @@ def evaluate_model(model, dataset, device):
     return correct / total
 
 
+def cleanup_data_resources(dataset):
+    """Cleanup data resources to prevent memory leaks"""
+    if dataset is None:
+        return
+
+    try:
+        # Explicitly close DataLoader iterators
+        for loader_name in ['train_loader', 'test_loader']:
+            if hasattr(dataset, loader_name):
+                loader = getattr(dataset, loader_name)
+                # Remove iterator to force cleanup
+                if hasattr(loader, '_iterator'):
+                    loader._iterator = None
+
+        # Clear dataset references
+        dataset.train_loader = None
+        dataset.test_loader = None
+        dataset.train_dataset = None
+        dataset.test_dataset = None
+    except Exception as e:
+        print(f"Warning during dataset cleanup: {e}")
+
+    # Force garbage collection
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def main(rank, args):
     """Main training function"""
     args.rank = rank
@@ -137,15 +210,20 @@ def main(rank, args):
     # Ensure save directory exists
     if not hasattr(args, 'save') or args.save is None:
         args.save = "checkpoints_precomputed"
-        print(f"Process {rank}: No save directory specified, using default: {args.save}")
+        if rank == 0:
+            print(f"Using default save directory: {args.save}")
 
     # Create save directory
     os.makedirs(args.save, exist_ok=True)
 
-    # Set default feature directory if not specified
+    # Set default feature directory
     if not hasattr(args, 'precomputed_dir') or args.precomputed_dir is None:
         args.precomputed_dir = os.path.join(args.data_location, "precomputed_features") \
             if hasattr(args, 'data_location') else "precomputed_features"
+
+    # Ensure model name is set
+    if not hasattr(args, 'model'):
+        args.model = "ViT-B-32"  # Default model
 
     # Ensure number of task vectors is set
     if not hasattr(args, 'num_task_vectors'):
@@ -153,17 +231,20 @@ def main(rank, args):
 
     for dataset_name in datasets_to_process:
         target_dataset = f"precomputed_{dataset_name}Val"  # Use precomputed features
-        print(f"=== Training on {dataset_name} with pre-computed features ===")
+        if rank == 0:
+            print(f"=== Training on {dataset_name} with pre-computed features ===")
 
         # Setup save directory for this dataset
         save_dir = os.path.join(args.save, dataset_name + "Val")
         os.makedirs(save_dir, exist_ok=True)
 
+        dataset = None
+
         try:
             # Get precomputed features for the current dataset
             dataset = get_precomputed_dataset(
                 dataset_name=target_dataset,
-                model_name=args.model,
+                model_name=args.model,  # Use original format with hyphens
                 location=args.data_location if hasattr(args, 'data_location') else ".",
                 batch_size=args.batch_size,
                 num_workers=4
@@ -173,7 +254,8 @@ def main(rank, args):
             sample_batch = next(iter(dataset.train_loader))
             sample_batch = maybe_dictionarize(sample_batch)
             feature_dim = sample_batch["features"].shape[1]
-            print(f"Feature dimension: {feature_dim}")
+            if rank == 0:
+                print(f"Feature dimension: {feature_dim}")
 
             # Create model
             model = PrecomputedMetaNet(
@@ -196,7 +278,7 @@ def main(rank, args):
             ddp_model = torch.nn.parallel.DistributedDataParallel(
                 model,
                 device_ids=[args.rank],
-                find_unused_parameters=True
+                find_unused_parameters=False
             )
 
             # Setup classifier layer
@@ -292,11 +374,20 @@ def main(rank, args):
 
                 # Evaluate on validation set
                 if is_main_process():
-                    model.eval()
-                    classifier.eval()
+                    # Create a combined model for evaluation
+                    class CombinedModel(torch.nn.Module):
+                        def __init__(self, feature_model, classifier):
+                            super().__init__()
+                            self.feature_model = feature_model
+                            self.classifier = classifier
+
+                        def forward(self, x):
+                            return self.classifier(self.feature_model(x))
+
+                    eval_model = CombinedModel(ddp_model.module, classifier)
 
                     val_acc = evaluate_model(
-                        model=lambda x: classifier(ddp_model.module(x)),
+                        model=eval_model,
                         dataset=dataset,
                         device=rank
                     )
@@ -309,11 +400,24 @@ def main(rank, args):
                     # Save best model
                     if val_acc > best_acc:
                         best_acc = val_acc
+
+                        # Store model configuration along with weights
+                        config = {
+                            'feature_dim': feature_dim,
+                            'num_task_vectors': args.num_task_vectors,
+                            'blockwise': args.blockwise_coef if hasattr(args, 'blockwise_coef') else False,
+                            'enable_causal': args.causal_intervention if hasattr(args, 'causal_intervention') else False,
+                            'top_k_ratio': args.top_k_ratio if hasattr(args, 'top_k_ratio') else 0.1,
+                            'model_name': args.model,
+                            'finetuning_mode': args.finetuning_mode if hasattr(args, 'finetuning_mode') else 'standard',
+                        }
+
                         best_model_state = {
                             'meta_net': ddp_model.module.state_dict(),
                             'classifier': classifier.state_dict(),
                             'epoch': epoch,
-                            'acc': val_acc
+                            'acc': val_acc,
+                            'config': config  # Add configuration information
                         }
 
             # Save results
@@ -342,7 +446,11 @@ def main(rank, args):
             print(f"Error processing dataset {dataset_name}: {e}")
             import traceback
             traceback.print_exc()
-            continue
+        finally:
+            # Clean up dataset resources
+            cleanup_data_resources(dataset)
+            torch.cuda.empty_cache()
+            gc.collect()
 
     cleanup_ddp()
 
@@ -355,9 +463,9 @@ if __name__ == "__main__":
     # Set default save directory if not provided
     if not hasattr(args, 'save') or args.save is None:
         args.save = "checkpoints_precomputed"
-        print(f"No save directory specified, using default: {args.save}")
+        print(f"Using default save directory: {args.save}")
 
-    # Add additional arguments for precomputed features
+    # Set feature directory path
     args.precomputed_dir = os.path.join(args.data_location, "precomputed_features") \
         if hasattr(args, 'data_location') else "precomputed_features"
 
@@ -365,18 +473,26 @@ if __name__ == "__main__":
 
     # Set default training parameters if not specified
     if not hasattr(args, 'epochs') or not args.epochs:
-        args.epochs = 10
+        args.epochs = 2
     if not hasattr(args, 'batch_size') or not args.batch_size:
         args.batch_size = 256  # Can use larger batch size with precomputed features
     if not hasattr(args, 'lr') or not args.lr:
-        args.lr = 1e-3
+        args.lr = 1e-2
     if not hasattr(args, 'wd') or not args.wd:
         args.wd = 0.01
 
     # Set random port if not specified to avoid conflicts
     if not hasattr(args, 'port') or not args.port:
         args.port = random.randint(40000, 65000)
-        print(f"Using randomly selected port: {args.port}")
 
     # Launch training
-    torch.multiprocessing.spawn(main, args=(args,), nprocs=args.world_size)
+    try:
+        torch.multiprocessing.spawn(main, args=(args,), nprocs=args.world_size)
+    except Exception as e:
+        print(f"Training failed with error: {e}")
+        traceback.print_exc()
+        # Force cleanup in case of failure
+        for i in range(torch.cuda.device_count()):
+            if i < args.world_size:
+                torch.cuda.set_device(i)
+                torch.cuda.empty_cache()

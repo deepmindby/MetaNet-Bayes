@@ -28,7 +28,7 @@ def parse_arguments():
     parser.add_argument(
         "--data-location",
         type=str,
-        default=os.path.expanduser("/home/haichao/zby/atlas/data"),
+        default=os.path.expanduser("/home/haichao/zby/MetaNet-Bayes"),
         help="The root directory for the datasets.",
     )
     parser.add_argument(
@@ -121,7 +121,7 @@ def parse_arguments():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=10,
+        default=2,
     )
     parser.add_argument(
         "--load",

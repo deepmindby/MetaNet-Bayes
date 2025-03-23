@@ -28,7 +28,7 @@ def get_precomputed_dataset(dataset_name, model_name, location, batch_size=128, 
     if dataset_name.startswith("precomputed_"):
         dataset_name = dataset_name[len("precomputed_"):]
 
-    # Model name already has correct format (e.g., ViT-B-32) - don't modify it
+    # Use original model name format without any replacement (keep hyphens)
     model_name_for_path = model_name
 
     # Build feature directory path
