@@ -173,6 +173,58 @@ def get_test_dataset(dataset_name, model_name, location, batch_size=128, num_wor
         dataset: Dataset with pre-computed features
     """
     try:
+        # Special handling for SUN397
+        if "SUN397" in dataset_name:
+            try:
+                from src.datasets.sun397_fix import SUN397FixedFeatures
+
+                # Try various paths for SUN397
+                possible_sun397_paths = [
+                    os.path.join(location, "precomputed_features", model_name, "SUN397"),
+                    os.path.join(location, "precomputed_features", model_name, "SUN397Val"),
+                    os.path.join(location, "precomputed_features", "SUN397"),
+                    os.path.join(location, model_name, "SUN397"),
+                    os.path.join(location, "features", "SUN397"),
+                ]
+
+                # Try each path
+                for path in possible_sun397_paths:
+                    if debug:
+                        print(f"Trying SUN397 path: {path}")
+                    if os.path.exists(path):
+                        try:
+                            return SUN397FixedFeatures(
+                                feature_dir=path,
+                                batch_size=batch_size,
+                                num_workers=num_workers
+                            )
+                        except Exception as e:
+                            if debug:
+                                print(f"Error with SUN397 path {path}: {e}")
+                            continue
+
+                # If no path works, try a recursive search
+                print("Searching recursively for SUN397 features...")
+                for root, dirs, files in os.walk(location):
+                    if "SUN397" in root and any(f.endswith(".pt") for f in files):
+                        if debug:
+                            print(f"Found potential SUN397 directory: {root}")
+                        try:
+                            return SUN397FixedFeatures(
+                                feature_dir=root,
+                                batch_size=batch_size,
+                                num_workers=num_workers
+                            )
+                        except Exception as e:
+                            if debug:
+                                print(f"Error with SUN397 path {root}: {e}")
+                            continue
+
+            except ImportError:
+                if debug:
+                    print("SUN397FixedFeatures not available, falling back to standard methods")
+
+        # Continue with regular dataset loading logic
         # Build possible feature directory paths
         possible_dirs = []
 
@@ -222,8 +274,10 @@ def get_test_dataset(dataset_name, model_name, location, batch_size=128, num_wor
                     continue
 
         print(f"WARNING: Could not find test features for {dataset_name} in any expected location")
-        for dir in possible_dirs:
-            print(f"  - Tried: {dir}")
+        if debug:
+            print("Tried the following directories:")
+            for dir in possible_dirs:
+                print(f"  - {dir}")
         return None
 
     except Exception as e:
@@ -287,6 +341,7 @@ def find_model_path(model_dir, model_name, dataset_name, debug=False):
             (f"{model_dir}-causal", model_name, name, "best_precomputed_model.pt"),
             (f"{model_dir}-meta", model_name, name, "best_precomputed_model.pt"),
             # Alternative file names
+            (model_dir, model_name, name, "best_precomputed_model_causal.pt"),
             (model_dir, model_name, name, "best_model.pt"),
             (model_dir, model_name, name, "model.pt"),
             (model_dir, name, "best_model.pt"),
@@ -376,10 +431,23 @@ def evaluate_model(model_path, dataset, device, debug=False):
         blockwise = args.blockwise_coef
         enable_causal = args.causal_intervention
         top_k_ratio = args.top_k_ratio
+
+        # Determine enable_causal from model path if not specified
+        if "causal" in model_path.lower():
+            enable_causal = True
+            if debug:
+                print(f"Detected causal model from path: {model_path}")
+
         if debug:
             print(f"Using parameters: feature_dim={feature_dim}, "
                 f"num_task_vectors={num_task_vectors}, blockwise={blockwise}, "
                 f"enable_causal={enable_causal}, top_k_ratio={top_k_ratio}")
+
+    # Add clear logging about causal status
+    if enable_causal:
+        print(f"\n*** CAUSAL INTERVENTION MODEL (top-k ratio: {top_k_ratio}) ***")
+    else:
+        print(f"\n*** STANDARD MODEL (NO CAUSAL INTERVENTION) ***")
 
     # Create model
     try:
@@ -610,6 +678,11 @@ def evaluate_model(model_path, dataset, device, debug=False):
         'std': float(np.std(all_confidences))
     }
 
+    # Determine model type from path
+    model_type = "STANDARD"
+    if "causal" in model_path.lower() or enable_causal:
+        model_type = "CAUSAL"
+
     # Compile complete results
     results = {
         'accuracy': accuracy,
@@ -626,6 +699,7 @@ def evaluate_model(model_path, dataset, device, debug=False):
             'top_k_ratio': top_k_ratio
         },
         'model_path': model_path,
+        'model_type': model_type,
         'evaluation_timestamp': datetime.now().isoformat()
     }
 
@@ -726,6 +800,7 @@ def main():
             # Print results
             print(f"Accuracy: {results['accuracy'] * 100:.2f}%")
             print(f"Number of samples: {results['num_samples']}")
+            print(f"Model type: {results['model_type']}")
 
             # Print detailed results if verbose
             if args.verbose:
@@ -754,6 +829,7 @@ def main():
                 'accuracy': results['accuracy'],
                 'samples': results['num_samples'],
                 'model_path': model_path,
+                'model_type': results['model_type']
             })
 
         except Exception as e:
@@ -785,11 +861,11 @@ def main():
 
     # Print summary
     print("\n=== Summary ===")
-    print(f"{'Dataset':<15} {'Accuracy':<10}")
-    print("-" * 25)
+    print(f"{'Dataset':<15} {'Accuracy':<10} {'Model Type':<15}")
+    print("-" * 40)
 
     for result in sorted(summary_results, key=lambda x: x['dataset']):
-        print(f"{result['dataset']:<15} {result['accuracy'] * 100:.2f}%")
+        print(f"{result['dataset']:<15} {result['accuracy'] * 100:.2f}% {result['model_type']:<15}")
 
 
 if __name__ == "__main__":

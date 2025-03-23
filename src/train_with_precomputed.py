@@ -107,6 +107,35 @@ def get_precomputed_dataset(dataset_name, model_name, location, batch_size=128, 
     Returns:
         dataset: Dataset with pre-computed features
     """
+    # Special handling for SUN397
+    if "SUN397" in dataset_name:
+        try:
+            from src.datasets.sun397_fix import SUN397FixedFeatures
+
+            # Try various paths for SUN397
+            possible_sun397_paths = [
+                os.path.join(location, "precomputed_features", model_name, "SUN397"),
+                os.path.join(location, "precomputed_features", model_name, "SUN397Val"),
+                os.path.join(location, "precomputed_features", "SUN397"),
+                os.path.join(location, model_name, "SUN397"),
+                os.path.join(location, "features", "SUN397"),
+            ]
+
+            # Try each path
+            for path in possible_sun397_paths:
+                if os.path.exists(path):
+                    try:
+                        return SUN397FixedFeatures(
+                            feature_dir=path,
+                            batch_size=batch_size,
+                            num_workers=num_workers
+                        )
+                    except Exception as e:
+                        print(f"Error with SUN397 path {path}: {e}")
+                        continue
+        except ImportError:
+            print("SUN397FixedFeatures not available, falling back to standard methods")
+
     # Import here to avoid circular imports
     from src.datasets.precomputed_features import PrecomputedFeatures
 
@@ -310,6 +339,7 @@ def main(rank, args):
             # Training monitoring
             train_losses = []
             epoch_losses = []
+            var_losses = []
             val_accuracies = []
             best_acc = 0.0
             best_model_state = None
@@ -321,7 +351,9 @@ def main(rank, args):
                 classifier.train()
 
                 epoch_loss = 0.0
+                epoch_var_loss = 0.0
                 batch_count = 0
+                var_loss_count = 0
 
                 for i, batch in enumerate(ddp_loader):
                     start_time = time.time()
@@ -343,8 +375,17 @@ def main(rank, args):
                             var_loss = ddp_model.module.compute_intervention_loss(features)
                             var_penalty = args.var_penalty_coef if hasattr(args, 'var_penalty_coef') else 0.1
                             total_loss = task_loss + var_penalty * var_loss
+
+                            # Record variance loss
+                            var_loss_cpu = var_loss.item()
+                            if var_loss_cpu > 0:
+                                epoch_var_loss += var_loss_cpu
+                                var_loss_count += 1
+                                if is_main_process():
+                                    var_losses.append(var_loss_cpu)
                         else:
                             var_loss = torch.tensor(0.0, device=features.device)
+                            var_loss_cpu = 0.0
                             total_loss = task_loss
 
                     # Backward pass
@@ -357,20 +398,31 @@ def main(rank, args):
                     optimizer.zero_grad()
 
                     # Record stats
+                    task_loss_cpu = task_loss.item()
                     batch_count += 1
-                    epoch_loss += task_loss.item()
-                    train_losses.append(task_loss.item())
+                    epoch_loss += task_loss_cpu
+                    if is_main_process():
+                        train_losses.append(task_loss_cpu)
 
                     # Print progress
                     if i % print_every == 0 and is_main_process():
-                        var_str = f", Var Loss: {var_loss.item():.6f}" if hasattr(args, 'causal_intervention') and args.causal_intervention else ""
+                        var_str = f", Var Loss: {var_loss_cpu:.6f}" if hasattr(args, 'causal_intervention') and args.causal_intervention else ""
                         print(f"Epoch {epoch+1}/{num_epochs}, Batch {i}/{num_batches}, "
-                              f"Loss: {task_loss.item():.6f}{var_str}, "
+                              f"Loss: {task_loss_cpu:.6f}{var_str}, "
                               f"Time: {time.time() - start_time:.3f}s")
 
                 # Record epoch stats
                 avg_epoch_loss = epoch_loss / batch_count if batch_count > 0 else 0
                 epoch_losses.append(avg_epoch_loss)
+
+                # Calculate average variance loss for the epoch
+                avg_epoch_var_loss = 0.0
+                if var_loss_count > 0:
+                    avg_epoch_var_loss = epoch_var_loss / var_loss_count
+
+                if is_main_process():
+                    print(f"Epoch {epoch+1} average - Task Loss: {avg_epoch_loss:.6f}, "
+                          f"Var Loss: {avg_epoch_var_loss:.6f}")
 
                 # Evaluate on validation set
                 if is_main_process():
@@ -422,8 +474,16 @@ def main(rank, args):
 
             # Save results
             if is_main_process():
-                # Save best model
+                # Save best model with clear causal indication in filename
+                causal_suffix = "_causal" if hasattr(args, 'causal_intervention') and args.causal_intervention else ""
+                model_filename = f"best_precomputed_model{causal_suffix}.pt"
+
                 if best_model_state:
+                    best_model_path = os.path.join(save_dir, model_filename)
+                    print(f"Saving best model to {best_model_path}")
+                    torch.save(best_model_state, best_model_path)
+
+                    # Save a copy with standard name for compatibility
                     torch.save(best_model_state, os.path.join(save_dir, "best_precomputed_model.pt"))
 
                 # Save training history
@@ -431,14 +491,16 @@ def main(rank, args):
                     'train_losses': train_losses,
                     'epoch_losses': epoch_losses,
                     'val_accuracies': val_accuracies,
-                    'best_acc': best_acc
+                    'best_acc': best_acc,
+                    'var_losses': var_losses if var_losses else [],
+                    'config': config if 'config' in locals() else {}
                 }
-                with open(os.path.join(save_dir, "precomputed_training_history.json"), 'w') as f:
+                with open(os.path.join(save_dir, f"precomputed_training_history{causal_suffix}.json"), 'w') as f:
                     json.dump(history, f, indent=4)
 
                 # Plot training curves
                 plot_dir = os.path.join(args.save, "precomputed_plots")
-                plot_training_curves(epoch_losses, val_accuracies, dataset_name, plot_dir)
+                plot_training_curves(epoch_losses, val_accuracies, f"{dataset_name}{causal_suffix}", plot_dir)
 
                 print(f"Training completed for {dataset_name}. Best validation accuracy: {best_acc*100:.2f}%")
 
@@ -473,7 +535,7 @@ if __name__ == "__main__":
 
     # Set default training parameters if not specified
     if not hasattr(args, 'epochs') or not args.epochs:
-        args.epochs = 20
+        args.epochs = 2
     if not hasattr(args, 'batch_size') or not args.batch_size:
         args.batch_size = 128  # Can use larger batch size with precomputed features
     if not hasattr(args, 'lr') or not args.lr:

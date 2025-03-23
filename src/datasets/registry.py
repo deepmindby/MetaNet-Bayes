@@ -19,26 +19,19 @@ import itertools
 from torch.utils.data.dataset import Subset, random_split
 
 from src.datasets.cars import Cars
-# from src.datasets.cifar10 import CIFAR10
-# from src.datasets.cifar100 import CIFAR100
 from src.datasets.dtd import DTD
 from src.datasets.eurosat import EuroSAT, EuroSATVal
 from src.datasets.gtsrb import GTSRB
-# from src.datasets.imagenet import ImageNet
 from src.datasets.mnist import MNIST
 from src.datasets.resisc45 import RESISC45
-# from src.datasets.stl10 import STL10
 from src.datasets.svhn import SVHN
 from src.datasets.sun397 import SUN397
-# from src.datasets.food import Food101
-# from src.datasets.caltech import Caltech256, Caltech101
-# from src.datasets.fgvc_aircraft import FGVCAircraft, FGVCAircraftVal
-# from src.datasets.flowers import Flowers102, Flowers102Val
-# from src.datasets.oxford_pets import OxfordIIITPet
-# from src.datasets.cub2011 import CUB200
-# from src.datasets.voc2007 import PascalVOC, PascalVOCVal
-# from src.datasets.country211 import Country211, Country211Val
-# from src.datasets.ucf101 import UCF101, UCF101Val
+
+# Add SUN397 fix for precomputed features
+try:
+    from src.datasets.sun397_fix import SUN397FixedFeatures
+except ImportError:
+    print("SUN397FixedFeatures not available")
 
 
 registry = {
@@ -52,7 +45,7 @@ class GenericDataset(object):
         self.train_loader = None
         self.test_dataset = None
         self.test_loader = None
-        self.classnames = None   
+        self.classnames = None
 
 
 def split_train_into_train_val(dataset, new_dataset_class_name, batch_size, num_workers, val_fraction, max_val_samples=None, seed=0):
@@ -73,8 +66,6 @@ def split_train_into_train_val(dataset, new_dataset_class_name, batch_size, num_
         lengths,
         generator=torch.Generator().manual_seed(seed)
     )
-    # if new_dataset_class_name == 'MNISTVal':
-    #     assert trainset.indices[0] == 36044
 
     new_dataset = None
 
@@ -174,8 +165,38 @@ def extract_class_data(dataset, cls_idx, batch_size, num_workers):
     return subset
 
 def get_dataset(dataset_name, preprocess, location, batch_size=128, num_workers=16, val_fraction=0.1, max_val_samples=5000):
+    # Handle SUN397 dataset specially for precomputed features
+    if dataset_name.startswith('precomputed_') and 'SUN397' in dataset_name:
+        try:
+            from src.datasets.sun397_fix import SUN397FixedFeatures
+            # Extract the actual dataset name
+            base_dataset_name = dataset_name[len('precomputed_'):]
+
+            # Try to determine feature directory
+            model_name = "ViT-B-32"  # Default model name
+            # Try to extract model name if in format "model_name.dataset_name"
+            if "." in base_dataset_name:
+                model_name, base_dataset_name = base_dataset_name.split(".", 1)
+
+            # Construct path to precomputed features
+            feature_dir = os.path.join(location, 'precomputed_features', model_name, base_dataset_name)
+
+            if os.path.exists(feature_dir):
+                print(f"Loading SUN397 features from {feature_dir}")
+                return SUN397FixedFeatures(
+                    feature_dir=feature_dir,
+                    preprocess=preprocess,
+                    location=location,
+                    batch_size=batch_size,
+                    num_workers=num_workers
+                )
+        except Exception as e:
+            print(f"Error loading SUN397 with FixedFeatures: {e}")
+            import traceback
+            traceback.print_exc()
+
     # Handle datasets in the format <CLSIDX_DATASETNAME>
-    # Check if requesting precomputed features
+    # Check if requesting precomputed features for other datasets
     if dataset_name.startswith('precomputed_'):
         # Extract the actual dataset name
         base_dataset_name = dataset_name[len('precomputed_'):]
@@ -199,7 +220,7 @@ def get_dataset(dataset_name, preprocess, location, batch_size=128, num_workers=
     if '_' in dataset_name:
         cls_idx, dataset_name = dataset_name.split('_')
         cls_idx = [int(i) for i in cls_idx]
-    
+
     if dataset_name.endswith('Val'):
         # Handle val splits
         if dataset_name in registry:
