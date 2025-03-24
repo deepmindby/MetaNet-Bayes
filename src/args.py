@@ -121,7 +121,7 @@ def parse_arguments():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=2,
+        default=20,
     )
     parser.add_argument(
         "--load",

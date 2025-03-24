@@ -8,6 +8,7 @@ SAVE_DIR="/home/haichao/zby/MetaNet-Bayes/precomputed_features"
 DATA_LOCATION="/home/haichao/zby/MetaNet-Bayes/data"
 MODEL="ViT-B-32"
 BATCH_SIZE=128  # 降低批次大小提高稳定性
+TIME_LIMITS=36000
 
 # 获取可用GPU数量
 GPU_COUNT=$(nvidia-smi --list-gpus | wc -l)
@@ -26,27 +27,27 @@ mkdir -p $LOG_DIR
 # 为每个数据集设置超时（秒）
 declare -A TIMEOUTS
 TIMEOUTS=(
-    ["Cars"]=3600
-    ["DTD"]=3600
-    ["EuroSAT"]=3600
-    ["GTSRB"]=3600
-    ["MNIST"]=3600
-    ["RESISC45"]=3600
-    ["SUN397"]=7200  # 为SUN397增加超时时间
-    ["SVHN"]=3600
+    ["Cars"]=$TIME_LIMITS
+    ["DTD"]=$TIME_LIMITS
+    ["EuroSAT"]=$TIME_LIMITS
+    ["GTSRB"]=$TIME_LIMITS
+    ["MNIST"]=$TIME_LIMITS
+    ["RESISC45"]=$TIME_LIMITS
+    ["SUN397"]=$TIME_LIMITS
+    ["SVHN"]=$TIME_LIMITS
 )
 
 # 为每个数据集设置批次超时（秒）
 declare -A BATCH_TIMEOUTS
 BATCH_TIMEOUTS=(
-    ["Cars"]=60
-    ["DTD"]=60
-    ["EuroSAT"]=60
-    ["GTSRB"]=60
-    ["MNIST"]=60
-    ["RESISC45"]=60
-    ["SUN397"]=120  # 为SUN397增加批次超时时间
-    ["SVHN"]=60
+    ["Cars"]=$TIME_LIMITS
+    ["DTD"]=$TIME_LIMITS
+    ["EuroSAT"]=$TIME_LIMITS
+    ["GTSRB"]=$TIME_LIMITS
+    ["MNIST"]=$TIME_LIMITS
+    ["RESISC45"]=$TIME_LIMITS
+    ["SUN397"]=$TIME_LIMITS
+    ["SVHN"]=$TIME_LIMITS
 )
 
 # 为特定数据集设置批次大小
@@ -58,7 +59,7 @@ BATCH_SIZES=(
     ["GTSRB"]=$BATCH_SIZE
     ["MNIST"]=$BATCH_SIZE
     ["RESISC45"]=$BATCH_SIZE
-    ["SUN397"]=64  # 对SUN397使用更小的批次大小
+    ["SUN397"]=$BATCH_SIZE
     ["SVHN"]=$BATCH_SIZE
 )
 

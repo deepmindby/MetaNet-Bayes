@@ -868,11 +868,11 @@ if __name__ == "__main__":
 
     # Set default training parameters if not specified
     if not hasattr(args, 'epochs') or not args.epochs:
-        args.epochs = 10
+        args.epochs = 20
     if not hasattr(args, 'batch_size') or not args.batch_size:
         args.batch_size = 128  # Can use larger batch size with precomputed features
     if not hasattr(args, 'lr') or not args.lr:
-        args.lr = 1e-3
+        args.lr = 1e-2
     if not hasattr(args, 'wd') or not args.wd:
         args.wd = 0.01
     if not hasattr(args, 'var_penalty_coef'):

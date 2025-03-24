@@ -165,7 +165,17 @@ def extract_class_data(dataset, cls_idx, batch_size, num_workers):
     return subset
 
 def get_dataset(dataset_name, preprocess, location, batch_size=128, num_workers=16, val_fraction=0.1, max_val_samples=5000):
+    if dataset_name == "SUN397":
+        print(f"Using simplified SUN397 loader")
+        from src.datasets.sun397_fix import SUN397Simple
+        return SUN397Simple(preprocess, location, batch_size, min(num_workers, 4))
+    elif dataset_name == "SUN397Val":
+        print(f"Using simplified SUN397Val loader")
+        from src.datasets.sun397_fix import SUN397ValSimple
+        return SUN397ValSimple(preprocess, location, batch_size, min(num_workers, 4))
+
     # Handle SUN397 dataset specially for precomputed features
+
     if dataset_name.startswith('precomputed_') and 'SUN397' in dataset_name:
         try:
             from src.datasets.sun397_fix import SUN397FixedFeatures
