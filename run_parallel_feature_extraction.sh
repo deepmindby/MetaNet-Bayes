@@ -18,7 +18,7 @@ echo "检测到 $GPU_COUNT 个可用GPU"
 mkdir -p $SAVE_DIR
 
 # 定义数据集列表
-DATASETS="Cars DTD EuroSAT GTSRB MNIST RESISC45 SUN397 SVHN"
+ DATASETS="Cars DTD EuroSAT GTSRB MNIST RESISC45 SVHN"
 
 # 创建日志目录
 LOG_DIR="${SAVE_DIR}/logs"

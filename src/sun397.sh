@@ -5,8 +5,8 @@
 # Basic parameters
 SAVE_DIR="/home/haichao/zby/MetaNet-Bayes/precomputed_features"
 DATA_LOCATION="/home/haichao/zby/MetaNet-Bayes/data"
-MODEL="ViT-B-32"
-BATCH_SIZE=64  # Lower batch size for SUN397
+MODEL="ViT-B-16"
+BATCH_SIZE=128  # Lower batch size for SUN397
 
 # Ensure save directory exists
 mkdir -p $SAVE_DIR

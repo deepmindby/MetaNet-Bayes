@@ -491,7 +491,8 @@ def main(rank, args):
     if hasattr(args, 'datasets') and args.datasets:
         datasets_to_process = args.datasets
     else:
-        datasets_to_process = ["MNIST", "SUN397", "SVHN", "EuroSAT", "GTSRB", "DTD", "Cars"]
+        # datasets_to_process = ["Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SUN397", "SVHN"]
+        datasets_to_process = ["SUN397"]
 
     # Fix path logic to avoid duplicating MetaNet-Bayes
     if not hasattr(args, 'save') or args.save is None:
@@ -872,7 +873,7 @@ if __name__ == "__main__":
     if not hasattr(args, 'batch_size') or not args.batch_size:
         args.batch_size = 128  # Can use larger batch size with precomputed features
     if not hasattr(args, 'lr') or not args.lr:
-        args.lr = 1e-2
+        args.lr = 5e-3
     if not hasattr(args, 'wd') or not args.wd:
         args.wd = 0.01
     if not hasattr(args, 'var_penalty_coef'):

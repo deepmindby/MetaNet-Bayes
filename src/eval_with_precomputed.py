@@ -163,7 +163,7 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=4,
                         help="Number of worker threads for data loading")
     parser.add_argument("--datasets", type=str, nargs="+",
-                        default=["MNIST", "SUN397", "SVHN", "EuroSAT", "GTSRB", "DTD", "Cars"],
+                        default=["Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SUN397", "SVHN"],
                         help="Datasets to evaluate")
     parser.add_argument("--blockwise-coef", action="store_true", default=False,
                         help="Whether blockwise coefficients were used")
