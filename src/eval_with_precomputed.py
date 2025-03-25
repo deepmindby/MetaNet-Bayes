@@ -179,6 +179,15 @@ def parse_args():
                         help="Enable debug mode")
     parser.add_argument("--only-test", action="store_true", default=True,
                         help="Only use test data for evaluation (enabled by default)")
+    # Add gating mechanism parameters
+    parser.add_argument("--use_gating", action="store_true", default=False,
+                        help="Whether to use adaptive gating mechanism")
+    parser.add_argument("--gating_threshold", type=float, default=0.0,
+                        help="Threshold for gating mechanism (α_T)")
+    parser.add_argument("--sampling_std", type=float, default=0.01,
+                        help="Standard deviation for sampling noise")
+    parser.add_argument("--num_samples", type=int, default=2, choices=[1, 2, 3],
+                        help="Number of samples for uncertainty estimation (1-3)")
     return parser.parse_args()
 
 
@@ -566,6 +575,21 @@ def evaluate_model(model_path, dataset, device, debug=False):
     model = model.to(device)
     model.eval()
 
+    # Set inference mode with gating parameters
+    if hasattr(model, 'set_inference_mode'):
+        gating_params = {
+            'use_gating': args.use_gating,
+            'gating_threshold': args.gating_threshold,
+            'sampling_std': args.sampling_std,
+            'num_samples': args.num_samples
+        }
+        if debug:
+            print(f"Setting inference mode with gating parameters: {gating_params}")
+        model.set_inference_mode(True, gating_params)
+    else:
+        if args.use_gating and debug:
+            print("Warning: Model does not support gating mechanism")
+
     # Create classifier
     try:
         if debug:
@@ -722,6 +746,17 @@ def evaluate_model(model_path, dataset, device, debug=False):
     if ("blockwise" in model_path.lower() or blockwise) and ("causal" in model_path.lower() or enable_causal):
         model_type = "BLOCKWISE_CAUSAL"
 
+    # Add gating information to model type if used
+    if args.use_gating:
+        model_type += "_GATED"
+
+    # Get uncertainty information if available
+    uncertainty = None
+    if hasattr(model, 'get_uncertainty') and args.num_samples > 1:
+        uncertainty = model.get_uncertainty()
+        if uncertainty is not None and (debug or args.verbose):
+            print(f"Prediction uncertainty: {uncertainty:.6f}")
+
     # Compile complete results
     results = {
         'accuracy': accuracy,
@@ -735,15 +770,25 @@ def evaluate_model(model_path, dataset, device, debug=False):
             'num_task_vectors': num_task_vectors,
             'blockwise': blockwise,
             'enable_causal': enable_causal,
-            'top_k_ratio': top_k_ratio
+            'top_k_ratio': top_k_ratio,
+            'use_gating': args.use_gating,
+            'gating_threshold': args.gating_threshold,
+            'sampling_std': args.sampling_std,
+            'num_samples': args.num_samples
         },
         'model_path': model_path,
         'model_type': model_type,
         'evaluation_timestamp': datetime.now().isoformat()
     }
 
+    # Add uncertainty information if available
+    if uncertainty is not None:
+        results['uncertainty'] = float(uncertainty)
+
     if debug:
         print(f"Evaluation complete. Accuracy: {accuracy * 100:.2f}%")
+        if uncertainty is not None:
+            print(f"Prediction uncertainty: {uncertainty:.6f}")
 
     return results
 
@@ -798,6 +843,10 @@ def main():
         config_suffix += "_blockwise"
     if args.causal_intervention:
         config_suffix += "_causal"
+    if args.use_gating:
+        config_suffix += "_gated"
+        if args.num_samples > 1:
+            config_suffix += f"_samples{args.num_samples}"
 
     # Print configuration
     print(f"\n=== Evaluation Configuration ===")
@@ -806,6 +855,9 @@ def main():
     print(f"Using causal intervention: {args.causal_intervention}")
     print(f"Top-k ratio: {args.top_k_ratio}")
     print(f"Number of task vectors: {args.num_task_vectors}")
+    if args.use_gating:
+        print(f"Gating enabled with threshold: {args.gating_threshold}")
+        print(f"Using {args.num_samples} samples with noise std: {args.sampling_std}")
     print(f"Model directory: {args.model_dir}")
     print(f"Data location: {args.data_location}")
     print(f"Output directory: {args.save_dir}")
@@ -874,6 +926,10 @@ def main():
             print(f"Number of samples: {results['num_samples']}")
             print(f"Model type: {results['model_type']}")
 
+            # Print uncertainty if available
+            if 'uncertainty' in results:
+                print(f"Prediction uncertainty: {results['uncertainty']:.6f}")
+
             # Print detailed results if verbose
             if args.verbose:
                 print("\nPer-class accuracy:")
@@ -896,13 +952,19 @@ def main():
             all_results[dataset_name] = results
 
             # Add to summary
-            summary_results.append({
+            summary_entry = {
                 'dataset': dataset_name,
                 'accuracy': results['accuracy'],
                 'samples': results['num_samples'],
                 'model_path': model_path,
                 'model_type': results['model_type']
-            })
+            }
+
+            # Add uncertainty if available
+            if 'uncertainty' in results:
+                summary_entry['uncertainty'] = results['uncertainty']
+
+            summary_results.append(summary_entry)
 
         except Exception as e:
             print(f"Error evaluating model for {dataset_name}: {e}")
@@ -919,6 +981,14 @@ def main():
         all_results['average_accuracy'] = avg_accuracy
         print(f"\nAverage accuracy across all datasets: {avg_accuracy * 100:.2f}%")
 
+        # Calculate average uncertainty if available
+        if any('uncertainty' in r for r in summary_results):
+            uncertainties = [r['uncertainty'] for r in summary_results if 'uncertainty' in r]
+            if uncertainties:
+                avg_uncertainty = sum(uncertainties) / len(uncertainties)
+                all_results['average_uncertainty'] = avg_uncertainty
+                print(f"Average uncertainty across all datasets: {avg_uncertainty:.6f}")
+
     # Save all results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results_path = os.path.join(
@@ -933,11 +1003,18 @@ def main():
 
     # Print summary
     print("\n=== Summary ===")
-    print(f"{'Dataset':<15} {'Accuracy':<10} {'Model Type':<15}")
-    print("-" * 40)
+    if args.use_gating and args.num_samples > 1:
+        print(f"{'Dataset':<15} {'Accuracy':<10} {'Uncertainty':<12} {'Model Type':<20}")
+        print("-" * 60)
+    else:
+        print(f"{'Dataset':<15} {'Accuracy':<10} {'Model Type':<20}")
+        print("-" * 45)
 
     for result in sorted(summary_results, key=lambda x: x['dataset']):
-        print(f"{result['dataset']:<15} {result['accuracy'] * 100:.2f}% {result['model_type']:<15}")
+        if 'uncertainty' in result and args.use_gating and args.num_samples > 1:
+            print(f"{result['dataset']:<15} {result['accuracy'] * 100:.2f}% {result['uncertainty']:<12.6f} {result['model_type']:<20}")
+        else:
+            print(f"{result['dataset']:<15} {result['accuracy'] * 100:.2f}% {result['model_type']:<20}")
 
 
 if __name__ == "__main__":
