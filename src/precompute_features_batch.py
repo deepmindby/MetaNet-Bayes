@@ -1,14 +1,12 @@
 """
-Batch Feature Extraction with Progressive Timeout and Memory Management
+Batch Feature Extraction with Progressive Timeout, Memory Management and Data Augmentation
 
 This script provides a robust approach to feature extraction by:
 1. Implementing batch-level timeouts
 2. Adding detailed progress monitoring
 3. Aggressively managing memory
 4. Supporting GPU device selection with automatic fallback
-
-Usage:
-    python precompute_features_batch.py --model ViT-B-32 --dataset SVHN --gpu-id 0
+5. Supporting multiple augmented versions of features
 """
 
 import os
@@ -189,8 +187,19 @@ def extract_features_safely(model, loader, features_path, labels_path, batch_tim
         memory_cleanup(force_gc=True)
         log_info("Feature extraction function complete")
 
-def extract_and_save_features(model, dataset_name, save_dir, data_location, batch_size, batch_timeout=60, gpu_id=0):
-    """Process a single dataset with robust error handling"""
+def extract_and_save_features(model, dataset_name, save_dir, data_location, batch_size, batch_timeout=60, gpu_id=0, num_augmentations=0):
+    """Process a single dataset with robust error handling and optional data augmentation
+
+    Args:
+        model: CLIP image encoder model
+        dataset_name: Name of the dataset
+        save_dir: Directory to save features
+        data_location: Root directory for datasets
+        batch_size: Batch size for feature extraction
+        batch_timeout: Timeout in seconds for each batch
+        gpu_id: GPU ID to use
+        num_augmentations: Number of augmented versions to create (default: 0)
+    """
     global processing_start_time
 
     log_info(f"=== Processing {dataset_name} ===")
@@ -215,32 +224,33 @@ def extract_and_save_features(model, dataset_name, save_dir, data_location, batc
             batch_size = max(16, batch_size // 2)
             log_info(f"Reduced batch size to {batch_size} for SUN397")
 
-        # Use validation preprocessing (no random augmentations)
-        preprocess = model.val_preprocess
+        # Use validation preprocessing (no random augmentations) for the standard features
+        val_preprocess = model.val_preprocess
 
-        # Get datasets
-        train_val_name = dataset_name + "Val"
-        log_info(f"Loading dataset {train_val_name}...")
+        # Get train preprocessing for augmentation (includes random transforms)
+        train_preprocess = model.train_preprocess
 
+        # Get datasets for different preprocessing methods
+        log_info(f"Loading dataset {dataset_name}Val with validation preprocessing...")
         train_val_dataset = get_dataset(
-            train_val_name,
-            preprocess,
+            dataset_name + "Val",
+            val_preprocess,
             location=data_location,
             batch_size=batch_size,
             num_workers=2,  # Reduced worker count for stability
         )
 
-        log_info(f"Loading dataset {dataset_name}...")
+        log_info(f"Loading dataset {dataset_name} with validation preprocessing...")
         test_dataset = get_dataset(
             dataset_name,
-            preprocess,
+            val_preprocess,
             location=data_location,
             batch_size=batch_size,
             num_workers=2,  # Reduced worker count for stability
         )
 
         # Create save directories
-        save_dir_train_val = os.path.join(save_dir, train_val_name)
+        save_dir_train_val = os.path.join(save_dir, dataset_name + "Val")
         save_dir_test = os.path.join(save_dir, dataset_name)
         os.makedirs(save_dir_train_val, exist_ok=True)
         os.makedirs(save_dir_test, exist_ok=True)
@@ -261,8 +271,8 @@ def extract_and_save_features(model, dataset_name, save_dir, data_location, batc
         adjusted_timeout = min(batch_timeout * (train_size / 5000), 300)  # Max 5 minutes per batch
         log_info(f"Using batch timeout of {adjusted_timeout:.1f}s for training set")
 
-        # Extract training features
-        log_info("Extracting training features...")
+        # First extract standard features with validation preprocessing
+        log_info("Extracting standard validation features...")
         extract_features_safely(
             model,
             train_val_dataset.train_loader,
@@ -272,7 +282,6 @@ def extract_and_save_features(model, dataset_name, save_dir, data_location, batc
         )
         memory_cleanup(force_gc=True)
 
-        # Extract validation features
         log_info("Extracting validation features...")
         extract_features_safely(
             model,
@@ -283,7 +292,6 @@ def extract_and_save_features(model, dataset_name, save_dir, data_location, batc
         )
         memory_cleanup(force_gc=True)
 
-        # Extract test features
         log_info("Extracting test features...")
         extract_features_safely(
             model,
@@ -292,6 +300,41 @@ def extract_and_save_features(model, dataset_name, save_dir, data_location, batc
             os.path.join(save_dir_test, "test_labels.pt"),
             batch_timeout=adjusted_timeout
         )
+        memory_cleanup(force_gc=True)
+
+        # Now extract augmented features if requested
+        if num_augmentations > 0:
+            log_info(f"Generating {num_augmentations} augmented feature versions...")
+
+            # Create dataset with training preprocessing (random augmentations)
+            for aug_idx in range(1, num_augmentations + 1):
+                log_info(f"Creating augmented version {aug_idx}/{num_augmentations}")
+
+                # Load dataset with train_preprocess for random augmentations
+                log_info(f"Loading dataset {dataset_name}Val with training preprocessing for augmentation {aug_idx}...")
+                aug_train_val_dataset = get_dataset(
+                    dataset_name + "Val",
+                    train_preprocess,
+                    location=data_location,
+                    batch_size=batch_size,
+                    num_workers=2,
+                )
+
+                # Extract augmented training features
+                log_info(f"Extracting augmented training features (version {aug_idx})...")
+                aug_features_path = os.path.join(save_dir_train_val, f"train_features_aug{aug_idx}.pt")
+                aug_labels_path = os.path.join(save_dir_train_val, f"train_labels_aug{aug_idx}.pt")
+
+                extract_features_safely(
+                    model,
+                    aug_train_val_dataset.train_loader,
+                    aug_features_path,
+                    aug_labels_path,
+                    batch_timeout=adjusted_timeout
+                )
+                memory_cleanup(force_gc=True)
+
+                log_info(f"Completed augmented version {aug_idx}")
 
         log_info(f"Completed processing {dataset_name}")
         return True
@@ -310,6 +353,7 @@ def extract_and_save_features(model, dataset_name, save_dir, data_location, batc
         log_info(f"GPU resources released after processing {dataset_name}")
 
 def parse_args():
+    """Parse command line arguments"""
     parser = argparse.ArgumentParser(description="Batch feature extraction")
     parser.add_argument("--model", type=str, default="ViT-B-32",
                         help="CLIP model to use (e.g. ViT-B-32)")
@@ -331,6 +375,8 @@ def parse_args():
     parser.add_argument("--openclip-cachedir", type=str,
                         default=os.path.expanduser("~/openclip-cachedir/open_clip"),
                         help="OpenCLIP cache directory")
+    parser.add_argument("--num-augmentations", type=int, default=0,
+                        help="Number of augmented versions to create (0 for none)")
     return parser.parse_args()
 
 def main():
@@ -359,6 +405,8 @@ def main():
     with open(os.path.join(model_save_dir, "model_info.txt"), "a") as f:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         f.write(f"[{timestamp}] Processing dataset: {args.dataset}\n")
+        if args.num_augmentations > 0:
+            f.write(f"[{timestamp}] Creating {args.num_augmentations} augmented versions\n")
 
     # Initialize model
     log_info(f"Initializing {args.model} model...")
@@ -378,7 +426,8 @@ def main():
         data_location=args.data_location,
         batch_size=args.batch_size,
         batch_timeout=args.batch_timeout,
-        gpu_id=args.gpu_id
+        gpu_id=args.gpu_id,
+        num_augmentations=args.num_augmentations
     )
 
     if success:

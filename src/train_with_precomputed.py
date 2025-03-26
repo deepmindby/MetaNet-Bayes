@@ -1,8 +1,8 @@
-"""Training Script Using Pre-computed Features
+"""Training Script Using Pre-computed Features with Augmentation Support
 
 This script trains MetaNet models using pre-computed CLIP features,
 which significantly accelerates training by avoiding the forward pass
-through the CLIP image encoder.
+through the CLIP image encoder. It supports using augmented feature versions.
 """
 
 import os
@@ -119,51 +119,38 @@ def plot_training_curves(train_losses, val_accuracies, dataset_name, save_dir, c
             filename_suffix += "_blockwise"
         if config.get('causal', False):
             filename_suffix += "_causal"
+        if config.get('use_augmentation', False):
+            filename_suffix += "_augmented"
 
     plt.savefig(os.path.join(save_dir, f'{dataset_name}{filename_suffix}_training_curves.png'))
     plt.close()
 
 
-class PrecomputedFeatureDataset(torch.utils.data.Dataset):
-    """Dataset for precomputed features with minimal logging"""
+def cleanup_resources(dataset):
+    """Cleanup data resources to prevent memory leaks"""
+    if dataset is None:
+        return
 
-    def __init__(self, features_path, labels_path, verbose=False):
-        """Initialize with paths to features and labels
+    try:
+        # Clear dataset references
+        if hasattr(dataset, 'test_loader') and dataset.test_loader is not None:
+            dataset.test_loader = None
+        if hasattr(dataset, 'train_loader') and dataset.train_loader is not None:
+            dataset.train_loader = None
+        if hasattr(dataset, 'test_dataset') and dataset.test_dataset is not None:
+            dataset.test_dataset = None
+        if hasattr(dataset, 'train_dataset') and dataset.train_dataset is not None:
+            dataset.train_dataset = None
+    except Exception as e:
+        print(f"Warning during dataset cleanup: {e}")
 
-        Args:
-            features_path: Path to features tensor
-            labels_path: Path to labels tensor
-            verbose: Whether to print detailed logs
-        """
-        super().__init__()
-
-        # Load features and labels
-        if verbose:
-            print(f"Loading features from {features_path}")
-        self.features = torch.load(features_path)
-
-        if verbose:
-            print(f"Loading labels from {labels_path}")
-        self.labels = torch.load(labels_path)
-
-        if len(self.features) != len(self.labels):
-            raise ValueError(f"Features ({len(self.features)}) and labels ({len(self.labels)}) count mismatch")
-
-        if verbose:
-            print(f"Loaded {len(self.features)} samples with feature dim {self.features.shape[1]}")
-
-    def __len__(self):
-        return len(self.features)
-
-    def __getitem__(self, idx):
-        return {
-            "features": self.features[idx],
-            "labels": self.labels[idx],
-            "index": idx
-        }
+    # Force garbage collection
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
-def get_precomputed_dataset(dataset_name, model_name, location, batch_size=128, num_workers=2, verbose=False):
+def get_precomputed_dataset(dataset_name, model_name, location, batch_size=128, num_workers=2,
+                           use_augmentation=True, max_augmentations=None, verbose=False):
     """Get dataset with pre-computed features with more robust path handling
 
     Args:
@@ -171,12 +158,17 @@ def get_precomputed_dataset(dataset_name, model_name, location, batch_size=128, 
         model_name: Name of the model used for feature extraction
         location: Root data directory
         batch_size: Batch size for dataloaders
-        num_workers: Number of worker threads (will be limited for safety)
+        num_workers: Number of worker threads
+        use_augmentation: Whether to use augmentations during training
+        max_augmentations: Maximum number of augmentations to use (None for all)
         verbose: Whether to print detailed logs
 
     Returns:
         dataset: Dataset with pre-computed features
     """
+    # Import required modules
+    from src.precomputed_feature_dataset import PrecomputedFeatures
+
     # Clean dataset name if it has "precomputed_" prefix
     if dataset_name.startswith("precomputed_"):
         dataset_name = dataset_name[len("precomputed_"):]
@@ -217,213 +209,51 @@ def get_precomputed_dataset(dataset_name, model_name, location, batch_size=128, 
         if "MetaNet-Bayes/MetaNet-Bayes" in path:
             possible_paths[i] = path.replace("MetaNet-Bayes/MetaNet-Bayes", "MetaNet-Bayes")
 
-    if verbose and is_main_process():
+    if verbose:
         print(f"Looking for features for {dataset_name} in {len(possible_paths)} locations")
 
     # Try each possible path
     for path in possible_paths:
         if os.path.exists(path):
-            if verbose and is_main_process():
+            if verbose:
                 print(f"Found directory at: {path}")
 
-            # Now check for different feature file patterns
-            feature_patterns = [
-                ("train_features.pt", "train_labels.pt"),
-                ("features.pt", "labels.pt"),
-                (os.path.join("train", "features.pt"), os.path.join("train", "labels.pt")),
-            ]
-
-            for feat_file, label_file in feature_patterns:
-                train_feat_path = os.path.join(path, feat_file)
-                train_label_path = os.path.join(path, label_file)
-
-                if os.path.exists(train_feat_path) and os.path.exists(train_label_path):
-                    if verbose and is_main_process():
-                        print(f"Found feature files: {train_feat_path} and {train_label_path}")
-
-                    # Now look for validation/test features
-                    val_patterns = [
-                        ("val_features.pt", "val_labels.pt"),
-                        ("test_features.pt", "test_labels.pt"),
-                        (os.path.join("val", "features.pt"), os.path.join("val", "labels.pt")),
-                        (os.path.join("test", "features.pt"), os.path.join("test", "labels.pt")),
-                    ]
-
-                    for val_feat_file, val_label_file in val_patterns:
-                        val_feat_path = os.path.join(path, val_feat_file)
-                        val_label_path = os.path.join(path, val_label_file)
-
-                        if os.path.exists(val_feat_path) and os.path.exists(val_label_path):
-                            if verbose and is_main_process():
-                                print(f"Found validation files: {val_feat_path} and {val_label_path}")
-
-                            # Create dataset with the found files
-                            try:
-                                # Create our custom dataset container
-                                train_dataset = PrecomputedFeatureDataset(
-                                    train_feat_path, train_label_path, verbose=verbose and is_main_process()
-                                )
-
-                                val_dataset = PrecomputedFeatureDataset(
-                                    val_feat_path, val_label_path, verbose=verbose and is_main_process()
-                                )
-
-                                # Create data loaders
-                                train_loader = torch.utils.data.DataLoader(
-                                    train_dataset,
-                                    batch_size=batch_size,
-                                    shuffle=True,
-                                    num_workers=min(num_workers, 2),
-                                    pin_memory=True,
-                                    timeout=60
-                                )
-
-                                val_loader = torch.utils.data.DataLoader(
-                                    val_dataset,
-                                    batch_size=batch_size,
-                                    shuffle=False,
-                                    num_workers=min(num_workers, 2),
-                                    pin_memory=True,
-                                    timeout=60
-                                )
-
-                                # Load classnames
-                                classnames_path = os.path.join(path, "classnames.txt")
-                                if os.path.exists(classnames_path):
-                                    with open(classnames_path, "r") as f:
-                                        classnames = [line.strip() for line in f.readlines()]
-                                    if verbose and is_main_process():
-                                        print(f"Loaded {len(classnames)} class names")
-                                else:
-                                    # Create dummy classnames
-                                    unique_labels = torch.unique(train_dataset.labels)
-                                    classnames = [f"class_{i}" for i in range(len(unique_labels))]
-                                    if verbose and is_main_process():
-                                        print(f"Created {len(classnames)} dummy class names")
-
-                                # Create dataset container
-                                dataset = type('', (), {})()
-                                dataset.train_dataset = train_dataset
-                                dataset.train_loader = train_loader
-                                dataset.test_dataset = val_dataset
-                                dataset.test_loader = val_loader
-                                dataset.classnames = classnames
-
-                                if is_main_process():
-                                    print(f"Successfully loaded dataset from {path}")
-                                    print(f"Train: {len(train_dataset)} samples, Test: {len(val_dataset)} samples")
-
-                                return dataset
-
-                            except Exception as e:
-                                if is_main_process():
-                                    print(f"Error creating dataset from {path}: {e}")
-                                # Continue to next option
+            try:
+                # Create our dataset with support for augmentation
+                return PrecomputedFeatures(
+                    feature_dir=path,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    use_augmentation=use_augmentation,
+                    max_augmentations=max_augmentations
+                )
+            except Exception as e:
+                print(f"Error creating dataset from {path}: {e}")
+                continue
 
     # If we get here, try a recursive search for any path containing the dataset name
-    if is_main_process():
+    if verbose:
         print(f"Standard search failed, performing recursive search for {base_name}...")
 
     for root, dirs, files in os.walk(location):
         if base_name.lower() in root.lower() and any(f.endswith('.pt') for f in files):
-            if is_main_process():
+            if verbose:
                 print(f"Found potential directory: {root}")
 
-            pt_files = [f for f in files if f.endswith('.pt')]
-            if is_main_process():
-                print(f"Found PT files: {pt_files}")
-
-            # Try to guess train/test patterns from file names
-            train_feat = None
-            train_label = None
-            val_feat = None
-            val_label = None
-
-            for f in pt_files:
-                if 'train' in f.lower() and 'feature' in f.lower():
-                    train_feat = os.path.join(root, f)
-                elif 'train' in f.lower() and 'label' in f.lower():
-                    train_label = os.path.join(root, f)
-                elif ('val' in f.lower() or 'test' in f.lower()) and 'feature' in f.lower():
-                    val_feat = os.path.join(root, f)
-                elif ('val' in f.lower() or 'test' in f.lower()) and 'label' in f.lower():
-                    val_label = os.path.join(root, f)
-
-            # If we found at least train features and labels
-            if train_feat and train_label:
-                # Use the same files for val if not found
-                if not val_feat:
-                    val_feat = train_feat
-                if not val_label:
-                    val_label = train_label
-
-                if is_main_process():
-                    print(f"Using train: {train_feat}, {train_label}")
-                    print(f"Using val: {val_feat}, {val_label}")
-
-                try:
-                    # Create our custom dataset container
-                    train_dataset = PrecomputedFeatureDataset(
-                        train_feat, train_label, verbose=verbose and is_main_process()
-                    )
-
-                    val_dataset = PrecomputedFeatureDataset(
-                        val_feat, val_label, verbose=verbose and is_main_process()
-                    )
-
-                    # Create data loaders
-                    train_loader = torch.utils.data.DataLoader(
-                        train_dataset,
-                        batch_size=batch_size,
-                        shuffle=True,
-                        num_workers=min(num_workers, 2),
-                        pin_memory=True,
-                        timeout=60
-                    )
-
-                    val_loader = torch.utils.data.DataLoader(
-                        val_dataset,
-                        batch_size=batch_size,
-                        shuffle=False,
-                        num_workers=min(num_workers, 2),
-                        pin_memory=True,
-                        timeout=60
-                    )
-
-                    # Try to find classnames or create dummy ones
-                    classnames_path = os.path.join(root, "classnames.txt")
-                    if os.path.exists(classnames_path):
-                        with open(classnames_path, "r") as f:
-                            classnames = [line.strip() for line in f.readlines()]
-                    else:
-                        # Create dummy classnames
-                        unique_labels = torch.unique(train_dataset.labels)
-                        classnames = [f"class_{i}" for i in range(len(unique_labels))]
-
-                    # Create dataset container
-                    dataset = type('', (), {})()
-                    dataset.train_dataset = train_dataset
-                    dataset.train_loader = train_loader
-                    dataset.test_dataset = val_dataset
-                    dataset.test_loader = val_loader
-                    dataset.classnames = classnames
-
-                    if is_main_process():
-                        print(f"Successfully loaded dataset from {root}")
-                        print(f"Train: {len(train_dataset)} samples, Test: {len(val_dataset)} samples")
-
-                    return dataset
-                except Exception as e:
-                    if is_main_process():
-                        print(f"Error creating dataset from recursive search: {e}")
+            try:
+                return PrecomputedFeatures(
+                    feature_dir=root,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    use_augmentation=use_augmentation,
+                    max_augmentations=max_augmentations
+                )
+            except Exception as e:
+                if verbose:
+                    print(f"Error creating dataset from {root}: {e}")
+                # Continue searching
 
     # If we get here, all paths failed
-    if is_main_process():
-        print(f"SEARCH FAILED: Attempted paths for {dataset_name}:")
-        for path in possible_paths:
-            exists = "exists" if os.path.exists(path) else "not found"
-            print(f"  - {path} ({exists})")
-
     raise FileNotFoundError(f"Pre-computed features not found for {dataset_name}")
 
 
@@ -450,40 +280,12 @@ def evaluate_model(model, dataset, device):
     return correct / total
 
 
-def cleanup_data_resources(dataset):
-    """Cleanup data resources to prevent memory leaks"""
-    if dataset is None:
-        return
-
-    try:
-        # Explicitly close DataLoader iterators
-        for loader_name in ['train_loader', 'test_loader']:
-            if hasattr(dataset, loader_name):
-                loader = getattr(dataset, loader_name)
-                # Remove iterator to force cleanup
-                if hasattr(loader, '_iterator'):
-                    loader._iterator = None
-
-        # Clear dataset references
-        dataset.train_loader = None
-        dataset.test_loader = None
-        dataset.train_dataset = None
-        dataset.test_dataset = None
-    except Exception as e:
-        if is_main_process():
-            print(f"Warning during dataset cleanup: {e}")
-
-    # Force garbage collection
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
 def main(rank, args):
-    """Main training function"""
+    """Main training function with augmentation support"""
     args.rank = rank
 
     # Initialize distributed setup with robust port handling
-    if not setup_ddp_robust(rank, args.world_size, args.port):
+    if not setup_ddp_robust(args.rank, args.world_size, args.port):
         print(f"Process {rank}: Failed to initialize distributed setup. Exiting.")
         return
 
@@ -491,8 +293,7 @@ def main(rank, args):
     if hasattr(args, 'datasets') and args.datasets:
         datasets_to_process = args.datasets
     else:
-        # datasets_to_process = ["Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SUN397", "SVHN"]
-        datasets_to_process = ["SUN397"]
+        datasets_to_process = ["Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SUN397", "SVHN"]
 
     # Fix path logic to avoid duplicating MetaNet-Bayes
     if not hasattr(args, 'save') or args.save is None:
@@ -530,6 +331,9 @@ def main(rank, args):
         print(f"Number of task vectors: {args.num_task_vectors}")
         print(f"Batch size: {args.batch_size}")
         print(f"Learning rate: {args.lr}")
+        print(f"Using augmentation: {args.use_augmentation}")
+        if args.use_augmentation:
+            print(f"Max augmentations: {args.max_augmentations if hasattr(args, 'max_augmentations') else 'All'}")
         print(f"Save directory: {args.save}")
         print("=" * 30)
 
@@ -546,13 +350,25 @@ def main(rank, args):
         dataset = None
 
         try:
-            # Get precomputed features with minimal verbose output
+            # Apply dataset-specific augmentation settings
+            use_augmentation = args.use_augmentation
+            max_augmentations = args.max_augmentations if hasattr(args, 'max_augmentations') else None
+
+            # Special case for SUN397 due to potential corrupted images issues
+            if dataset_name == "SUN397" and hasattr(args, 'sun397_no_augmentation') and args.sun397_no_augmentation:
+                if is_main_process():
+                    print(f"Disabling augmentation for SUN397 dataset due to sun397_no_augmentation flag")
+                use_augmentation = False
+
+            # Get precomputed features with augmentation support
             dataset = get_precomputed_dataset(
                 dataset_name=target_dataset,
                 model_name=args.model,
                 location=args.data_location if hasattr(args, 'data_location') else ".",
                 batch_size=args.batch_size,
                 num_workers=2,  # Reduced for stability
+                use_augmentation=use_augmentation,
+                max_augmentations=max_augmentations,
                 verbose=True  # Enable verbose mode to debug path issues
             )
 
@@ -577,7 +393,7 @@ def main(rank, args):
                     enable_causal=args.causal_intervention if hasattr(args, 'causal_intervention') else False,
                     top_k_ratio=args.top_k_ratio if hasattr(args, 'top_k_ratio') else 0.1
                 )
-                model = model.cuda()
+                model = model.to(device)
             except Exception as e:
                 if is_main_process():
                     print(f"Error creating model: {e}")
@@ -660,6 +476,12 @@ def main(rank, args):
                         features = batch["features"].to(rank)
                         labels = batch["labels"].to(rank)
 
+                        # Track augmentation usage if available
+                        augmented = batch.get("augmented", False)
+                        if i % print_every == 0 and is_main_process() and "augmented" in batch:
+                            aug_count = sum(1 for item in batch["augmented"] if item)
+                            print(f"Batch {i}: Using {aug_count}/{len(batch['augmented'])} augmented samples")
+
                         with torch.autocast(device_type='cuda', dtype=torch.float16):
                             # Forward pass
                             transformed_features = ddp_model(features)
@@ -668,7 +490,7 @@ def main(rank, args):
                             # Task loss
                             task_loss = loss_fn(logits, labels)
 
-                            # Variance loss if causal intervention is enabled
+                            # Add variance loss if causal intervention is enabled
                             if hasattr(args, 'causal_intervention') and args.causal_intervention:
                                 var_loss = ddp_model.module.compute_intervention_loss(features)
                                 var_penalty = args.var_penalty_coef if hasattr(args, 'var_penalty_coef') else 0.01
@@ -766,6 +588,8 @@ def main(rank, args):
                             'top_k_ratio': args.top_k_ratio if hasattr(args, 'top_k_ratio') else 0.1,
                             'model_name': args.model,
                             'finetuning_mode': args.finetuning_mode if hasattr(args, 'finetuning_mode') else 'standard',
+                            'use_augmentation': args.use_augmentation,
+                            'max_augmentations': args.max_augmentations if hasattr(args, 'max_augmentations') else None
                         }
 
                         best_model_state = {
@@ -784,6 +608,9 @@ def main(rank, args):
                     model_type += "_blockwise"
                 if args.causal_intervention:
                     model_type += "_causal"
+                if args.use_augmentation:
+                    model_type += "_augmented"
+
                 model_filename = f"best_precomputed_model{model_type}.pt"
 
                 if best_model_state:
@@ -801,7 +628,9 @@ def main(rank, args):
                     'val_accuracies': val_accuracies,
                     'best_acc': best_acc,
                     'var_losses': var_losses if var_losses else [],
-                    'config': config if 'config' in locals() else {}
+                    'config': config if 'config' in locals() else {},
+                    'use_augmentation': args.use_augmentation,
+                    'max_augmentations': args.max_augmentations if hasattr(args, 'max_augmentations') else None
                 }
                 with open(os.path.join(save_dir, f"precomputed_training_history{model_type}.json"), 'w') as f:
                     json.dump(history, f, indent=4)
@@ -811,7 +640,8 @@ def main(rank, args):
                 plot_config = {
                     'blockwise': args.blockwise_coef,
                     'causal': args.causal_intervention,
-                    'top_k_ratio': args.top_k_ratio if hasattr(args, 'top_k_ratio') else 0.1
+                    'top_k_ratio': args.top_k_ratio if hasattr(args, 'top_k_ratio') else 0.1,
+                    'use_augmentation': args.use_augmentation
                 }
                 plot_training_curves(epoch_losses, val_accuracies, dataset_name, plot_dir, plot_config)
 
@@ -824,7 +654,7 @@ def main(rank, args):
                 traceback.print_exc()
         finally:
             # Clean up dataset resources
-            cleanup_data_resources(dataset)
+            cleanup_resources(dataset)
             torch.cuda.empty_cache()
             gc.collect()
 
@@ -864,6 +694,15 @@ if __name__ == "__main__":
         args.precomputed_dir = os.path.join(current_dir, "precomputed_features")
     else:
         args.precomputed_dir = os.path.join(current_dir, "MetaNet-Bayes", "precomputed_features")
+
+    # Augmentation settings
+    if not hasattr(args, 'use_augmentation'):
+        args.use_augmentation = True  # Default to using augmentation
+    if not hasattr(args, 'max_augmentations'):
+        args.max_augmentations = None  # Use all available augmentations
+
+    # Special case for SUN397 - you can set a flag to disable augmentation just for SUN397
+    args.sun397_no_augmentation = False  # Change to True if needed
 
     args.num_task_vectors = 8  # Default number of task vectors to simulate
 

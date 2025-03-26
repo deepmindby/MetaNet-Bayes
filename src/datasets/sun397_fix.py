@@ -1,5 +1,6 @@
 """
 SUN397 dataset specialized loader with optimizations for feature extraction
+and handling of corrupted image files.
 
 This module provides a streamlined version of the SUN397 dataset loader
 that avoids expensive class_splits computation and is optimized for
@@ -9,6 +10,42 @@ memory efficiency and stability.
 import os
 import torch
 import torchvision.datasets as datasets
+from PIL import Image, ImageFile
+import warnings
+from torch.utils.data import Dataset
+
+# Tell PIL to be more lenient with corrupted files
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+class RobustImageFolder(datasets.ImageFolder):
+    """A more robust ImageFolder class that can handle corrupted images"""
+
+    def __getitem__(self, index):
+        """Override to add error handling for corrupted images"""
+        path, target = self.samples[index]
+
+        # Try to load the image, with robust error handling
+        for _ in range(3):  # Try up to 3 times
+            try:
+                sample = self.loader(path)
+                if self.transform is not None:
+                    sample = self.transform(sample)
+                if self.target_transform is not None:
+                    target = self.target_transform(target)
+                return sample, target
+            except Exception as e:
+                # If loading fails, create a blank image as fallback
+                warnings.warn(f"Error loading image {path}: {e}. Using blank image.")
+                # Create a 224x224 blank image (standard size for CLIP)
+                sample = Image.new('RGB', (224, 224), color='black')
+                if self.transform is not None:
+                    sample = self.transform(sample)
+                if self.target_transform is not None:
+                    target = self.target_transform(target)
+                break  # Return the blank image
+
+        return sample, target
+
 
 class SUN397Simple:
     """Simplified SUN397 loader without expensive class_splits computation"""
@@ -52,10 +89,11 @@ class SUN397Simple:
         print(f"Loading SUN397 train data from: {traindir}")
         print(f"Loading SUN397 test data from: {testdir}")
 
-        self.train_dataset = datasets.ImageFolder(
+        # Use robust image folder implementation
+        self.train_dataset = RobustImageFolder(
             traindir, transform=preprocess)
 
-        # Use smaller batch_size and num_workers
+        # Use smaller batch_size and num_workers with more robust DataLoader settings
         self.train_loader = torch.utils.data.DataLoader(
             self.train_dataset,
             shuffle=True,
@@ -63,17 +101,21 @@ class SUN397Simple:
             num_workers=min(num_workers, 4),
             persistent_workers=False,
             pin_memory=True,
-            timeout=60
+            timeout=120,  # Increased timeout
+            prefetch_factor=2,  # Reduce prefetching
+            drop_last=False
         )
 
-        self.test_dataset = datasets.ImageFolder(testdir, transform=preprocess)
+        self.test_dataset = RobustImageFolder(testdir, transform=preprocess)
         self.test_loader = torch.utils.data.DataLoader(
             self.test_dataset,
             batch_size=batch_size,
             num_workers=min(num_workers, 4),
             persistent_workers=False,
             pin_memory=True,
-            timeout=60
+            timeout=120,
+            prefetch_factor=2,
+            drop_last=False
         )
 
         # Get class names
@@ -111,14 +153,16 @@ class SUN397ValSimple(SUN397Simple):
 
         if valdir:
             print(f"Loading SUN397Val validation data from: {valdir}")
-            self.test_dataset = datasets.ImageFolder(valdir, transform=preprocess)
+            self.test_dataset = RobustImageFolder(valdir, transform=preprocess)
             self.test_loader = torch.utils.data.DataLoader(
                 self.test_dataset,
                 batch_size=batch_size,
                 num_workers=min(num_workers, 4),
                 persistent_workers=False,
                 pin_memory=True,
-                timeout=60
+                timeout=120,
+                prefetch_factor=2,
+                drop_last=False
             )
         else:
             print("Warning: No validation directory found for SUN397Val, using test data")

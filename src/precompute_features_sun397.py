@@ -1,8 +1,9 @@
 """
-SUN397 Feature Extraction Script
+SUN397 Feature Extraction Script with Augmentation Support and Robust Image Handling
 
 A specialized script for extracting features from the SUN397 dataset,
-using a more memory-efficient approach with incremental processing.
+using a more memory-efficient approach with incremental processing and
+supporting multiple augmented versions.
 """
 
 import os
@@ -12,6 +13,12 @@ import argparse
 import traceback
 from datetime import datetime
 from tqdm import tqdm
+import warnings
+from PIL import Image, ImageFile
+
+# Tell PIL to be more lenient with corrupted files
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 from src.modeling import ImageEncoder
 from src.datasets.sun397_fix import SUN397Simple, SUN397ValSimple
 
@@ -127,26 +134,37 @@ def extract_features_safely(model, loader, features_path, labels_path):
         memory_cleanup()
 
 
-def extract_sun397_features(model, save_dir, data_location, batch_size):
-    """Extract features for SUN397 dataset"""
+def extract_sun397_features(model, save_dir, data_location, batch_size, num_augmentations=10):
+    """Extract features for SUN397 dataset with optional augmentation
+
+    Args:
+        model: CLIP image encoder model
+        save_dir: Directory to save features
+        data_location: Root directory for datasets
+        batch_size: Batch size for feature extraction
+        num_augmentations: Number of augmented versions to create (default: 10)
+    """
     log_info("=== Processing SUN397 dataset ===")
 
-    # Use validation preprocessing (no random augmentations)
-    preprocess = model.val_preprocess
+    # Use validation preprocessing (no random augmentations) for the standard features
+    val_preprocess = model.val_preprocess
+
+    # Get train preprocessing for augmentation (includes random transforms)
+    train_preprocess = model.train_preprocess
 
     try:
-        # Load datasets
-        log_info("Loading SUN397Val dataset...")
+        # Load datasets with validation preprocessing
+        log_info("Loading SUN397Val dataset with validation preprocessing...")
         train_val_dataset = SUN397ValSimple(
-            preprocess,
+            val_preprocess,
             location=data_location,
             batch_size=batch_size,
             num_workers=2  # Reduced for stability
         )
 
-        log_info("Loading SUN397 dataset...")
+        log_info("Loading SUN397 dataset with validation preprocessing...")
         test_dataset = SUN397Simple(
-            preprocess,
+            val_preprocess,
             location=data_location,
             batch_size=batch_size,
             num_workers=2
@@ -165,8 +183,8 @@ def extract_sun397_features(model, save_dir, data_location, batch_size):
             with open(os.path.join(save_dir_test, "classnames.txt"), "w") as f:
                 f.write("\n".join(test_dataset.classnames))
 
-        # Extract training features
-        log_info("Extracting training features...")
+        # Extract standard features with validation preprocessing
+        log_info("Extracting standard training features...")
         extract_features_safely(
             model,
             train_val_dataset.train_loader,
@@ -175,7 +193,6 @@ def extract_sun397_features(model, save_dir, data_location, batch_size):
         )
         memory_cleanup()
 
-        # Extract validation features
         log_info("Extracting validation features...")
         extract_features_safely(
             model,
@@ -185,7 +202,6 @@ def extract_sun397_features(model, save_dir, data_location, batch_size):
         )
         memory_cleanup()
 
-        # Extract test features
         log_info("Extracting test features...")
         extract_features_safely(
             model,
@@ -193,6 +209,38 @@ def extract_sun397_features(model, save_dir, data_location, batch_size):
             os.path.join(save_dir_test, "test_features.pt"),
             os.path.join(save_dir_test, "test_labels.pt")
         )
+        memory_cleanup()
+
+        # Now extract augmented features if requested
+        if num_augmentations > 0:
+            log_info(f"Generating {num_augmentations} augmented feature versions...")
+
+            for aug_idx in range(1, num_augmentations + 1):
+                log_info(f"Creating augmented version {aug_idx}/{num_augmentations}")
+
+                # Load dataset with train_preprocess for random augmentations
+                log_info(f"Loading SUN397Val dataset with training preprocessing for augmentation {aug_idx}...")
+                aug_train_val_dataset = SUN397ValSimple(
+                    train_preprocess,
+                    location=data_location,
+                    batch_size=batch_size,
+                    num_workers=2,
+                )
+
+                # Extract augmented training features
+                log_info(f"Extracting augmented training features (version {aug_idx})...")
+                aug_features_path = os.path.join(save_dir_train_val, f"train_features_aug{aug_idx}.pt")
+                aug_labels_path = os.path.join(save_dir_train_val, f"train_labels_aug{aug_idx}.pt")
+
+                extract_features_safely(
+                    model,
+                    aug_train_val_dataset.train_loader,
+                    aug_features_path,
+                    aug_labels_path
+                )
+                memory_cleanup()
+
+                log_info(f"Completed augmented version {aug_idx}")
 
         log_info("Completed processing SUN397")
         return True
@@ -222,6 +270,8 @@ def parse_args():
     parser.add_argument("--openclip-cachedir", type=str,
                         default=os.path.expanduser("~/openclip-cachedir/open_clip"),
                         help="OpenCLIP cache directory")
+    parser.add_argument("--num-augmentations", type=int, default=10,
+                        help="Number of augmented versions to create (default: 10)")
     return parser.parse_args()
 
 
@@ -237,6 +287,8 @@ def main():
     with open(os.path.join(model_save_dir, "model_info.txt"), "a") as f:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         f.write(f"[{timestamp}] Processing dataset: SUN397\n")
+        if args.num_augmentations > 0:
+            f.write(f"[{timestamp}] Creating {args.num_augmentations} augmented versions\n")
 
     # Initialize model
     log_info(f"Initializing {args.model} model...")
@@ -253,7 +305,8 @@ def main():
         model=image_encoder,
         save_dir=model_save_dir,
         data_location=args.data_location,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        num_augmentations=args.num_augmentations
     )
 
     if success:

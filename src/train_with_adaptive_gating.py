@@ -1,6 +1,7 @@
 """Training Script Using Adaptive Gating MetaNet with Pre-computed Features
 
-This script trains MetaNet models with adaptive gating using pre-computed CLIP features.
+This script trains MetaNet models with adaptive gating mechanism using pre-computed
+CLIP features, supporting augmented feature versions for improved performance.
 """
 
 import os
@@ -8,20 +9,18 @@ import time
 import json
 import torch
 import random
-import socket
 import numpy as np
 import matplotlib.pyplot as plt
 from torch.cuda.amp import GradScaler
 import gc
 import sys
-import datetime
 import traceback
+from datetime import datetime, timedelta
 
 from src.adaptive_gating_metanet import AdaptiveGatingMetaNet
 from src.utils import cosine_lr
 from src.datasets.common import maybe_dictionarize
-from src.distributed import cleanup_ddp, is_main_process
-from src.train_with_precomputed import get_precomputed_dataset
+from src.distributed import cleanup_ddp, distribute_loader, is_main_process, setup_ddp
 
 
 def cleanup_resources(dataset):
@@ -47,48 +46,39 @@ def cleanup_resources(dataset):
     torch.cuda.empty_cache()
 
 
-def distribute_loader(loader):
-    """Distribute data loader across processes"""
-    from src.distributed import distribute_loader as dist_loader
-    try:
-        return dist_loader(loader)
-    except Exception as e:
-        print(f"Error distributing loader: {e}")
-        # Fallback to the original loader if distribution fails
-        return loader
-
-
-def setup_ddp_robust(rank, world_size, port=None):
-    """More robust distributed training initialization"""
-    # Use random port to avoid conflicts
+def setup_ddp_robust(rank, world_size, port=None, max_retries=5):
+    """Setup distributed training with robust port handling"""
+    # Generate random port if not specified
     if port is None:
-        port = random.randint(29500, 65000)
+        port = random.randint(40000, 65000)
 
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(port)
-
-    # Add timeout and retry logic
-    max_retries = 5
     for retry in range(max_retries):
         try:
+            # Use different port for each retry
+            current_port = port + retry
+
+            os.environ["MASTER_ADDR"] = "localhost"
+            os.environ["MASTER_PORT"] = str(current_port)
+
             torch.distributed.init_process_group(
                 "nccl",
                 rank=rank,
                 world_size=world_size,
-                timeout=datetime.timedelta(minutes=1)
+                timeout=timedelta(minutes=10)
             )
             torch.cuda.set_device(rank)
             torch.distributed.barrier()
-            print(f"Process {rank}: DDP initialized successfully on port {port}")
-            return True
-        except Exception as e:
-            print(f"Process {rank}: DDP initialization error (attempt {retry+1}/{max_retries}): {e}")
-            # Try a different port
-            port = port + retry + 1
-            os.environ["MASTER_PORT"] = str(port)
-            time.sleep(1)
 
-    print(f"Process {rank}: Failed to initialize distributed setup")
+            if rank == 0:
+                print(f"Successfully initialized distributed setup with {world_size} processes")
+            return True
+
+        except Exception as e:
+            print(f"Process {rank}: Failed on port {current_port}: {e}")
+            # Wait before retrying
+            time.sleep(random.uniform(1, 3))
+
+    print(f"Process {rank}: Failed to initialize distributed setup after {max_retries} attempts")
     return False
 
 
@@ -237,40 +227,158 @@ def plot_gradients(grad_magnitudes, dataset_name, plot_dir):
     plt.close()
 
 
-def parse_args():
-    """Parse command line arguments"""
-    from src.args import parse_arguments
-    args = parse_arguments()
+def get_precomputed_dataset(dataset_name, model_name, location, batch_size=128, num_workers=2,
+                           use_augmentation=True, max_augmentations=None, verbose=False):
+    """Get dataset with pre-computed features with improved path handling
 
-    # Set default for new parameters if not specified
-    if not hasattr(args, 'base_threshold') or args.base_threshold is None:
-        args.base_threshold = 0.05
-    if not hasattr(args, 'beta') or args.beta is None:
-        args.beta = 1.0
-    if not hasattr(args, 'uncertainty_reg') or args.uncertainty_reg is None:
-        args.uncertainty_reg = 0.01
+    Args:
+        dataset_name: Name of the dataset
+        model_name: Name of the model used for feature extraction
+        location: Root data directory
+        batch_size: Batch size for dataloaders
+        num_workers: Number of worker threads
+        use_augmentation: Whether to use augmentations during training
+        max_augmentations: Maximum number of augmentations to use (None for all)
+        verbose: Whether to print detailed logs
 
-    return args
+    Returns:
+        dataset: Dataset with pre-computed features
+    """
+    # Import required modules
+    from src.precomputed_feature_dataset import PrecomputedFeatures
+
+    # Clean dataset name if it has "precomputed_" prefix
+    if dataset_name.startswith("precomputed_"):
+        dataset_name = dataset_name[len("precomputed_"):]
+
+    # Handle the case where dataset ends with "Val"
+    base_name = dataset_name
+    if dataset_name.endswith("Val"):
+        base_name = dataset_name[:-3]
+
+    # Try with common paths - now with more path variations
+    possible_paths = [
+        # With model name
+        os.path.join(location, "precomputed_features", model_name, dataset_name),
+        os.path.join(location, "precomputed_features", model_name, base_name),
+        os.path.join(location, "precomputed_features", model_name, base_name + "Val"),
+        # Without model name
+        os.path.join(location, "precomputed_features", dataset_name),
+        os.path.join(location, "precomputed_features", base_name),
+        os.path.join(location, "precomputed_features", base_name + "Val"),
+        # Other common locations
+        os.path.join(location, dataset_name),
+        os.path.join(location, base_name),
+        os.path.join(location, base_name + "Val"),
+    ]
+
+    # Special case for SUN397
+    if "SUN397" in dataset_name:
+        sun_paths = [
+            os.path.join(location, "precomputed_features", "SUN397"),
+            os.path.join(location, "SUN397"),
+            os.path.join(location, "precomputed_features", model_name, "SUN397"),
+            os.path.join(location, "precomputed_features", "SUN397Val"),
+        ]
+        possible_paths = sun_paths + possible_paths
+
+    # Fix redundant paths
+    for i, path in enumerate(possible_paths):
+        if "MetaNet-Bayes/MetaNet-Bayes" in path:
+            possible_paths[i] = path.replace("MetaNet-Bayes/MetaNet-Bayes", "MetaNet-Bayes")
+
+    if verbose:
+        print(f"Looking for features for {dataset_name} in {len(possible_paths)} locations")
+
+    # Try each possible path
+    for path in possible_paths:
+        if os.path.exists(path):
+            if verbose:
+                print(f"Found directory at: {path}")
+
+            try:
+                # Create our dataset with support for augmentation
+                return PrecomputedFeatures(
+                    feature_dir=path,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    use_augmentation=use_augmentation,
+                    max_augmentations=max_augmentations
+                )
+            except Exception as e:
+                print(f"Error creating dataset from {path}: {e}")
+                continue
+
+    # If we get here, try a recursive search
+    if verbose:
+        print(f"Standard search failed, performing recursive search for {base_name}...")
+
+    for root, dirs, files in os.walk(location):
+        if base_name.lower() in root.lower() and any(f.endswith('.pt') for f in files):
+            if verbose:
+                print(f"Found potential directory: {root}")
+
+            try:
+                return PrecomputedFeatures(
+                    feature_dir=root,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    use_augmentation=use_augmentation,
+                    max_augmentations=max_augmentations
+                )
+            except Exception as e:
+                if verbose:
+                    print(f"Error creating dataset from {root}: {e}")
+                # Continue searching
+
+    # If we get here, all paths failed
+    raise FileNotFoundError(f"Pre-computed features not found for {dataset_name}")
+
+
+def evaluate_model(model, classifier, dataset, device):
+    """Evaluate model on dataset"""
+    model.eval()
+    classifier.eval()
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for batch in dataset.test_loader:
+            batch = maybe_dictionarize(batch)
+            features = batch["features"].to(device)
+            labels = batch["labels"].to(device)
+
+            # Forward pass
+            transformed_features = model(features)
+            outputs = classifier(transformed_features)
+
+            # Compute accuracy
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+
+    return correct / total
 
 
 def main(rank, args):
-    """Main training function"""
+    """Main training function with adaptive gating"""
     args.rank = rank
 
-    # Initialize distributed setup with robust method
+    # Initialize distributed setup with robust port handling
     if not setup_ddp_robust(args.rank, args.world_size, args.port):
         print(f"Process {rank}: Failed to initialize distributed setup. Exiting.")
         return
 
-    # Process datasets
+    # Process all datasets specified or use defaults
     if hasattr(args, 'datasets') and args.datasets:
         datasets_to_process = args.datasets
     else:
-        datasets_to_process = ["Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SUN397", "SVHN"]
-        # datasets_to_process = ["Cars"]
+        # datasets_to_process = ["Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SUN397", "SVHN"]
+        datasets_to_process = ["Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SVHN"]
 
-    # Fix save directory path
+    # Fix path logic to avoid duplicating MetaNet-Bayes
     if not hasattr(args, 'save') or args.save is None:
+        # Check if we're already in MetaNet-Bayes directory
         current_dir = os.getcwd()
         if current_dir.endswith('MetaNet-Bayes'):
             args.save = os.path.join(current_dir, "checkpoints_adaptive_gating")
@@ -283,28 +391,33 @@ def main(rank, args):
     if is_main_process():
         os.makedirs(args.save, exist_ok=True)
 
-    # Fix data location path
-    if not hasattr(args, 'data_location') or args.data_location is None:
-        current_dir = os.getcwd()
+    # Fix data location to proper path
+    current_dir = os.getcwd()
+    if hasattr(args, 'data_location') and args.data_location:
+        # Remove redundant MetaNet-Bayes if present
+        if "MetaNet-Bayes/MetaNet-Bayes" in args.data_location:
+            args.data_location = args.data_location.replace("MetaNet-Bayes/MetaNet-Bayes", "MetaNet-Bayes")
+    else:
+        # Set default data location
         if current_dir.endswith('MetaNet-Bayes'):
             args.data_location = current_dir
         else:
             args.data_location = os.path.join(current_dir, "MetaNet-Bayes")
-        if "MetaNet-Bayes/MetaNet-Bayes" in args.data_location:
-            args.data_location = args.data_location.replace("MetaNet-Bayes/MetaNet-Bayes", "MetaNet-Bayes")
 
-    # Print configuration
+    # Print configuration only from main process
     if rank == 0:
         print(f"\n=== Training Configuration ===")
         print(f"Model: {args.model}")
-        print(f"Blockwise coefficients: {args.blockwise_coef}")
+        print(f"Using blockwise coefficients: {args.blockwise_coef}")
         print(f"Initial αT: {args.base_threshold:.4f}, β: {args.beta:.4f}")
         print(f"Uncertainty regularization: {args.uncertainty_reg}")
-        print(f"Causal intervention: {args.causal_intervention if hasattr(args, 'causal_intervention') else False}")
+        print(f"Using augmentation: {args.use_augmentation}")
+        if args.use_augmentation:
+            print(f"Max augmentations: {args.max_augmentations if hasattr(args, 'max_augmentations') else 'All'}")
         print(f"Batch size: {args.batch_size}")
         print(f"Learning rate: {args.lr}")
+        print(f"Epochs: {args.epochs}")
         print(f"Save directory: {args.save}")
-        print(f"Data location: {args.data_location}")
         print("=" * 30)
 
     for dataset_name in datasets_to_process:
@@ -320,14 +433,26 @@ def main(rank, args):
         dataset = None
 
         try:
-            # Get dataset with precomputed features
+            # Apply dataset-specific augmentation settings
+            use_augmentation = args.use_augmentation
+            max_augmentations = args.max_augmentations if hasattr(args, 'max_augmentations') else None
+
+            # Special case for SUN397 due to potential corrupted images issues
+            if dataset_name == "SUN397" and hasattr(args, 'sun397_no_augmentation') and args.sun397_no_augmentation:
+                if is_main_process():
+                    print(f"Disabling augmentation for SUN397 dataset due to sun397_no_augmentation flag")
+                use_augmentation = False
+
+            # Get precomputed features with augmentation support
             dataset = get_precomputed_dataset(
                 dataset_name=target_dataset,
                 model_name=args.model,
                 location=args.data_location,
                 batch_size=args.batch_size,
                 num_workers=2,  # Reduced for stability
-                verbose=True
+                use_augmentation=use_augmentation,
+                max_augmentations=max_augmentations,
+                verbose=True  # Debug path issues
             )
 
             # Sample feature to get dimensions
@@ -353,17 +478,7 @@ def main(rank, args):
                     beta=args.beta,
                     uncertainty_reg=args.uncertainty_reg
                 )
-
-                # Handle causal intervention compatibility
-                if hasattr(args, 'causal_intervention') and args.causal_intervention:
-                    if is_main_process():
-                        print("Note: Both causal intervention and adaptive gating are enabled")
-                        print("Adaptive gating will be used as the primary intervention mechanism")
-
-                    # Add causal_intervention attribute if needed by other parts of code
-                    model.causal_intervention = True
-
-                model = model.cuda()
+                model = model.to(rank)
             except Exception as e:
                 if is_main_process():
                     print(f"Error creating model: {e}")
@@ -389,7 +504,7 @@ def main(rank, args):
                     ddp_model = torch.nn.parallel.DistributedDataParallel(
                         model,
                         device_ids=[args.rank],
-                        find_unused_parameters=False  # Changed to False to fix warning
+                        find_unused_parameters=False
                     )
                 except Exception as e:
                     if is_main_process():
@@ -398,8 +513,14 @@ def main(rank, args):
                         ddp_loader = data_loader
 
             # Setup classifier layer
-            num_classes = len(dataset.classnames)
-            classifier = torch.nn.Linear(feature_dim, num_classes).cuda()
+            try:
+                num_classes = len(dataset.classnames)
+                classifier = torch.nn.Linear(feature_dim, num_classes).cuda()
+            except Exception as e:
+                if is_main_process():
+                    print(f"Error setting up classifier: {e}")
+                    traceback.print_exc()
+                raise
 
             # Setup optimizer with different parameter groups
             try:
@@ -424,7 +545,7 @@ def main(rank, args):
 
                 # Create parameter groups with different learning rates
                 param_groups = [
-                    {'params': gating_log_params, 'lr': args.lr * 100, 'weight_decay': 0.0001},  # Very high LR for gating params
+                    {'params': gating_log_params, 'lr': args.lr * 100, 'weight_decay': 0.0001},  # Higher LR for gating
                     {'params': meta_net_params, 'lr': args.lr * 2, 'weight_decay': 0.001},      # Higher LR for meta_net
                     {'params': other_params, 'lr': args.lr, 'weight_decay': args.wd if hasattr(args, 'wd') else 0.01}
                 ]
@@ -484,6 +605,11 @@ def main(rank, args):
                         features = batch["features"].to(rank)
                         labels = batch["labels"].to(rank)
 
+                        # Track augmentation usage if available
+                        if i % print_every == 0 and is_main_process() and "augmented" in batch:
+                            aug_count = sum(1 for item in batch["augmented"] if item)
+                            print(f"Batch {i}: Using {aug_count}/{len(batch['augmented'])} augmented samples")
+
                         with torch.autocast(device_type='cuda', dtype=torch.float16):
                             # Forward pass
                             transformed_features = ddp_model(features)
@@ -492,7 +618,7 @@ def main(rank, args):
                             # Task loss
                             task_loss = loss_fn(logits, labels)
 
-                            # Add uncertainty regularization - use the current model instance
+                            # Add uncertainty regularization
                             if isinstance(ddp_model, torch.nn.parallel.DistributedDataParallel):
                                 reg_loss = ddp_model.module.uncertainty_regularization_loss()
                             else:
@@ -511,7 +637,7 @@ def main(rank, args):
                             else:
                                 model_ref = ddp_model
 
-                            # Get gradients - use item() or None check
+                            # Get gradients
                             log_base_grad = model_ref.log_base_threshold.grad
                             log_beta_grad = model_ref.log_beta.grad
 
@@ -558,9 +684,11 @@ def main(rank, args):
                                     gating_stats.append(stats)
                                     gating_ratio = stats.get('gating_ratio', 0.0)
 
-                            # Compact, single-line progress output with shortened elapsed time
+                            # Compact progress output with shortened elapsed time
                             t_elapsed = time.time() - start_time
-                            print(f"  Batch {i:4d}/{num_batches:4d} | Loss: {task_loss_cpu:.4f} | Reg: {reg_loss_cpu:.4f} | αT: {current_base_threshold:.4f} | β: {current_beta:.4f} | Gate: {gating_ratio:.3f} | t: {t_elapsed:.2f}s")
+                            print(f"  Batch {i:4d}/{num_batches:4d} | Loss: {task_loss_cpu:.4f} | "
+                                  f"Reg: {reg_loss_cpu:.4f} | αT: {current_base_threshold:.4f} | "
+                                  f"β: {current_beta:.4f} | Gate: {gating_ratio:.3f} | t: {t_elapsed:.2f}s")
 
                     except Exception as e:
                         if is_main_process():
@@ -593,50 +721,28 @@ def main(rank, args):
                     log_beta_values.append(current_log_beta)
 
                     # Epoch summary
-                    print(f"  Summary: Task Loss: {avg_epoch_loss:.4f} | Reg Loss: {avg_epoch_reg_loss:.4f} | αT: {current_base_threshold:.4f} | β: {current_beta:.4f}")
+                    print(f"  Summary: Task Loss: {avg_epoch_loss:.4f} | Reg Loss: {avg_epoch_reg_loss:.4f} | "
+                          f"αT: {current_base_threshold:.4f} | β: {current_beta:.4f}")
 
                 # Evaluate on validation set
                 if is_main_process():
                     print(f"Epoch {epoch+1}/{num_epochs} - Validation")
 
-                    # Create a combined model for evaluation
-                    class CombinedModel(torch.nn.Module):
-                        def __init__(self, feature_model, classifier):
-                            super().__init__()
-                            self.feature_model = feature_model
-                            self.classifier = classifier
-
-                        def forward(self, x):
-                            return self.classifier(self.feature_model(x))
-
-                    # Evaluate using appropriate model
+                    # Get model for evaluation
                     if isinstance(ddp_model, torch.nn.parallel.DistributedDataParallel):
-                        eval_model = CombinedModel(ddp_model.module, classifier)
+                        eval_model = ddp_model.module
                     else:
-                        eval_model = CombinedModel(ddp_model, classifier)
+                        eval_model = ddp_model
 
-                    eval_model.eval()
-
-                    # Validation loop
-                    correct = 0
-                    total = 0
-                    with torch.no_grad():
-                        for batch in dataset.test_loader:
-                            batch = maybe_dictionarize(batch)
-                            features = batch["features"].cuda()
-                            labels = batch["labels"].cuda()
-
-                            # Forward pass
-                            outputs = eval_model(features)
-                            _, predicted = outputs.max(1)
-
-                            total += labels.size(0)
-                            correct += predicted.eq(labels).sum().item()
-
-                    val_acc = correct / total
+                    val_acc = evaluate_model(
+                        model=eval_model,
+                        classifier=classifier,
+                        dataset=dataset,
+                        device=rank
+                    )
                     val_accuracies.append(val_acc)
 
-                    print(f"  Accuracy: {val_acc*100:.2f}% ({correct}/{total})")
+                    print(f"  Accuracy: {val_acc*100:.2f}% ({int(val_acc * len(dataset.test_dataset))}/{len(dataset.test_dataset)})")
 
                     # Save best model
                     if val_acc > best_acc:
@@ -653,7 +759,7 @@ def main(rank, args):
                             'log_beta': current_log_beta,
                             'uncertainty_reg': args.uncertainty_reg,
                             'model_name': args.model,
-                            'causal_intervention': args.causal_intervention if hasattr(args, 'causal_intervention') else False
+                            'use_augmentation': args.use_augmentation
                         }
 
                         # Get appropriate state dict
@@ -692,7 +798,8 @@ def main(rank, args):
                     'log_beta_values': log_beta_values,
                     'grad_magnitudes': grad_magnitudes,
                     'best_acc': best_acc,
-                    'config': config if 'config' in locals() else {}
+                    'config': config if 'config' in locals() else {},
+                    'use_augmentation': args.use_augmentation
                 }
 
                 with open(os.path.join(save_dir, "adaptive_gating_training_history.json"), 'w') as f:
@@ -700,7 +807,7 @@ def main(rank, args):
                     for key in history:
                         if isinstance(history[key], (list, dict)) and key not in ['gating_stats', 'grad_magnitudes']:
                             history[key] = [float(item) if isinstance(item, (np.floating, np.integer)) else item
-                                           for item in history[key]]
+                                          for item in history[key]]
 
                     json.dump(history, f, indent=4)
 
@@ -739,7 +846,8 @@ def main(rank, args):
 
 if __name__ == "__main__":
     # Parse arguments
-    args = parse_args()
+    from src.args import parse_arguments
+    args = parse_arguments()
 
     # Set random seed for reproducibility
     if args.seed is not None:
@@ -749,12 +857,38 @@ if __name__ == "__main__":
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
 
-    # Set default values for new parameters
+    # Set default values for adaptive gating parameters
+    if not hasattr(args, 'base_threshold') or args.base_threshold is None:
+        args.base_threshold = 0.05
+    if not hasattr(args, 'beta') or args.beta is None:
+        args.beta = 1.0
+    if not hasattr(args, 'uncertainty_reg') or args.uncertainty_reg is None:
+        args.uncertainty_reg = 0.01
     if not hasattr(args, 'num_task_vectors'):
         args.num_task_vectors = 8
 
+    # Augmentation settings
+    if not hasattr(args, 'use_augmentation'):
+        args.use_augmentation = True  # Default to using augmentation
+    if not hasattr(args, 'max_augmentations'):
+        args.max_augmentations = None  # Use all available augmentations
+
+    # Special case for SUN397
+    args.sun397_no_augmentation = False
+
+    # Set default training parameters if not specified
     if not hasattr(args, 'lr') or not args.lr:
         args.lr = 5e-3
+    if not hasattr(args, 'epochs') or not args.epochs:
+        args.epochs = 20
+    if not hasattr(args, 'batch_size') or not args.batch_size:
+        args.batch_size = 128
+    if not hasattr(args, 'wd') or not args.wd:
+        args.wd = 0.01
+
+    # Set random port if not specified to avoid conflicts
+    if not hasattr(args, 'port') or not args.port:
+        args.port = random.randint(40000, 65000)
 
     # Launch training with better error handling
     try:
@@ -762,7 +896,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Training failed with error: {e}")
         traceback.print_exc()
-        # Force cleanup
+        # Force cleanup in case of failure
         for i in range(torch.cuda.device_count()):
             if i < args.world_size:
                 try:
