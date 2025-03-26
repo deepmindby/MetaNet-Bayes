@@ -266,7 +266,7 @@ def main(rank, args):
 
                 # Create parameter groups with different learning rates
                 param_groups = [
-                    {'params': gating_params, 'lr': args.lr * 10 if args.lr < 0.001 else args.lr},
+                    {'params': gating_params, 'lr': args.lr * 10},  # if args.lr < 0.001 else args.lr},
                     {'params': other_params, 'lr': args.lr}
                 ]
 
@@ -329,7 +329,7 @@ def main(rank, args):
                             task_loss = loss_fn(logits, labels)
 
                             # Add uncertainty regularization
-                            reg_loss = ddp_model.module.uncertainty_regularization_loss()
+                            reg_loss = model.uncertainty_regularization_loss()
                             total_loss = task_loss + reg_loss
 
                         # Backward pass
