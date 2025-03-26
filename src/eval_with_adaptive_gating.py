@@ -369,6 +369,41 @@ def find_model_path(model_dir, model_name, dataset_name, debug=False):
     raise FileNotFoundError(f"Could not find model for {dataset_name} in {model_dir}")
 
 
+def compute_gating_ratio(model, features, device):
+    """计算实际的门控率，确保模型在正确的模式下运行"""
+    # 确保模型在评估模式下
+    model.eval()
+
+    # 随机抽样一小部分特征
+    sample_size = min(64, features.size(0))
+    indices = torch.randperm(features.size(0))[:sample_size]
+    sample_features = features[indices].to(device)
+
+    with torch.no_grad():
+        # 生成系数
+        if hasattr(model, 'blockwise') and model.blockwise:
+            batch_coefficients = model.meta_net(sample_features).reshape(
+                -1, model.num_task_vectors, model.num_blocks)
+
+            # 使用实际的参数计算阈值
+            base_threshold = model.base_threshold
+            beta_val = model.beta
+
+            # 默认不确定性值
+            uncertainties = torch.ones_like(batch_coefficients) * 0.5
+
+            # 计算阈值
+            thresholds = base_threshold * (1.0 + beta_val * uncertainties)
+
+            # 计算门控掩码和比率
+            gating_mask = (torch.abs(batch_coefficients) >= thresholds).float()
+            gating_ratio = gating_mask.mean().item()
+
+            return gating_ratio
+        else:
+            return 0.0  # 非blockwise模型不适用门控比率计算
+
+
 def evaluate_model(model_path, dataset, device, args):
     """Evaluate adaptive gating model on dataset"""
     # Load model state
@@ -396,6 +431,9 @@ def evaluate_model(model_path, dataset, device, args):
         beta = config.get('beta', args.beta)
         uncertainty_reg = config.get('uncertainty_reg', args.uncertainty_reg)
 
+        # Always print config values - this is important for debugging
+        print(f"Using model parameters: αT={base_threshold:.4f}, β={beta:.4f}")
+
         if args.debug:
             print(f"Model config: feature_dim={feature_dim}, num_task_vectors={num_task_vectors}, "
                   f"blockwise={blockwise}, base_threshold={base_threshold}, beta={beta}")
@@ -419,6 +457,8 @@ def evaluate_model(model_path, dataset, device, args):
         beta = args.beta
         uncertainty_reg = args.uncertainty_reg
 
+        print(f"WARNING: No config in model, using default parameters: αT={base_threshold:.4f}, β={beta:.4f}")
+
         if args.debug:
             print(f"Using parameters: feature_dim={feature_dim}, num_task_vectors={num_task_vectors}, "
                   f"blockwise={blockwise}, base_threshold={base_threshold}, beta={beta}")
@@ -437,7 +477,8 @@ def evaluate_model(model_path, dataset, device, args):
         )
 
         # In evaluation, we should set training mode to False
-        model.training_mode = False
+        if hasattr(model, 'training_mode'):
+            model.training_mode = False
 
         # Load meta_net weights
         if 'meta_net' in state_dict:
@@ -489,6 +530,25 @@ def evaluate_model(model_path, dataset, device, args):
 
     model = model.to(device)
     model.eval()
+
+    # 添加输出模型加载状态标志
+    model.is_loaded = True
+
+    # Verify the loaded parameters match expected values from config
+    actual_base_threshold = model.base_threshold.item()
+    actual_beta = model.beta.item()
+
+    # Print actual values to verify they were loaded correctly
+    print(f"Model loaded with: αT={actual_base_threshold:.4f}, β={actual_beta:.4f}")
+
+    # Check if actual values match config/expected values within a tolerance
+    threshold_diff = abs(actual_base_threshold - base_threshold)
+    beta_diff = abs(actual_beta - beta)
+
+    # Warn if significant differences found
+    if threshold_diff > 1e-4 or beta_diff > 1e-4:
+        print(f"WARNING: Parameter mismatch! Expected αT={base_threshold:.4f}, β={beta:.4f}")
+        print(f"         but got αT={actual_base_threshold:.4f}, β={actual_beta:.4f}")
 
     # Create classifier
     try:
@@ -566,6 +626,18 @@ def evaluate_model(model_path, dataset, device, args):
 
     try:
         with torch.no_grad():
+            # 首先，获取第一个批次的特征用于计算门控率
+            first_batch = next(iter(dataset.test_loader))
+            if isinstance(first_batch, dict):
+                first_features = first_batch["features"]
+            else:
+                first_features, _ = first_batch
+
+            # 计算实际门控率
+            gating_ratio = compute_gating_ratio(model, first_features, device)
+            print(f"Actual gating ratio (from evaluation): {gating_ratio:.4f}")
+
+            # 继续进行常规评估
             for batch in tqdm(dataset.test_loader, desc="Evaluating", disable=not args.verbose):
                 if isinstance(batch, dict):
                     features = batch["features"].to(device)
@@ -659,13 +731,14 @@ def evaluate_model(model_path, dataset, device, args):
             'feature_dim': feature_dim,
             'num_task_vectors': num_task_vectors,
             'blockwise': blockwise,
-            'base_threshold': base_threshold,
-            'beta': beta,
+            'base_threshold': actual_base_threshold,  # Use actual loaded values
+            'beta': actual_beta,  # Use actual loaded values
             'uncertainty_reg': uncertainty_reg,
         },
         'model_path': model_path,
         'model_type': model_type,
-        'evaluation_timestamp': datetime.now().isoformat()
+        'evaluation_timestamp': datetime.now().isoformat(),
+        'computed_gating_ratio': gating_ratio  # Add computed gating ratio
     }
 
     # Add gating stats if available
@@ -735,8 +808,7 @@ def main():
     print(f"\n=== Evaluation Configuration ===")
     print(f"Model: {args.model}")
     print(f"Blockwise coefficients: {args.blockwise_coef}")
-    print(f"Base threshold: {args.base_threshold}")
-    print(f"Beta: {args.beta}")
+    print(f"Default αT: {args.base_threshold:.4f}, β: {args.beta:.4f}")
     print(f"Uncertainty reg: {args.uncertainty_reg}")
     print(f"Datasets to evaluate: {args.datasets}")
     print("=" * 30)
@@ -828,11 +900,15 @@ def main():
                 'dataset': dataset_name,
                 'accuracy': results['accuracy'],
                 'samples': results['num_samples'],
-                'model_type': results['model_type']
+                'model_type': results['model_type'],
+                'base_threshold': results['config']['base_threshold'],
+                'beta': results['config']['beta']
             }
 
-            # Add gating ratio if available
-            if 'gating_stats' in results:
+            # Add computed gating ratio if available
+            if 'computed_gating_ratio' in results:
+                summary_entry['gating_ratio'] = results['computed_gating_ratio']
+            elif 'gating_stats' in results and 'gating_ratio' in results['gating_stats']:
                 summary_entry['gating_ratio'] = results['gating_stats']['gating_ratio']
 
             summary_results.append(summary_entry)
@@ -873,21 +949,24 @@ def main():
 
     print(f"\nAll evaluation results saved to {results_path}")
 
-    # Print summary table
+    # Print summary table with fixed alignment
     print("\n=== Summary ===")
     if any('gating_ratio' in r for r in summary_results):
-        print(f"{'Dataset':<15} {'Accuracy':<10} {'Gating Ratio':<12} {'Model Type':<20}")
-        print("-" * 60)
+        print(f"{'Dataset':<15} {'Accuracy':<10} {'Gating Ratio':<12} {'αT':<8} {'β':<8} {'Model Type':<20}")
+        print("-" * 75)
     else:
-        print(f"{'Dataset':<15} {'Accuracy':<10} {'Model Type':<20}")
-        print("-" * 45)
+        print(f"{'Dataset':<15} {'Accuracy':<10} {'αT':<8} {'β':<8} {'Model Type':<20}")
+        print("-" * 65)
 
     for result in sorted(summary_results, key=lambda x: x['dataset']):
         if 'gating_ratio' in result:
             print(
-                f"{result['dataset']:<15} {result['accuracy'] * 100:.2f}% {result['gating_ratio']:<12.4f} {result['model_type']:<20}")
+                f"{result['dataset']:<15} {result['accuracy'] * 100:>6.2f}%  {result['gating_ratio']:<12.4f} "
+                f"{result['base_threshold']:>7.4f} {result['beta']:>7.4f} {result['model_type']:<20}")
         else:
-            print(f"{result['dataset']:<15} {result['accuracy'] * 100:.2f}% {result['model_type']:<20}")
+            print(
+                f"{result['dataset']:<15} {result['accuracy'] * 100:>6.2f}%  "
+                f"{result['base_threshold']:>7.4f} {result['beta']:>7.4f} {result['model_type']:<20}")
 
 
 if __name__ == "__main__":

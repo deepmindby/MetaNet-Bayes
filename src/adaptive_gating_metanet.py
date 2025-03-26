@@ -278,15 +278,17 @@ class AdaptiveGatingMetaNet(nn.Module):
         beta_val = self.beta
 
         # Track parameter usage for debugging
-        self.threshold_usage_counter += 1
-        self.beta_usage_counter += 1
+        if hasattr(self, 'threshold_usage_counter'):
+            self.threshold_usage_counter += 1
+        if hasattr(self, 'beta_usage_counter'):
+            self.beta_usage_counter += 1
 
         # Compute adaptive thresholds - higher uncertainty means higher threshold
         # Force both parameters to be used in the computation
         thresholds = base_threshold * (1.0 + beta_val * uncertainties)
 
         # Add coefficient-specific dynamic adjustment based on coefficient distribution
-        if self.last_coefficient_stats is not None:
+        if hasattr(self, 'last_coefficient_stats') and self.last_coefficient_stats is not None:
             # Get standard deviation and properly reshape it
             std = self.last_coefficient_stats['std']  # [1, num_task_vectors * num_blocks] or [1, num_task_vectors]
             shape = self.last_coefficient_stats['shape']  # (num_task_vectors, num_blocks) or (num_task_vectors, 1)
@@ -305,14 +307,23 @@ class AdaptiveGatingMetaNet(nn.Module):
                 # Expand to match batch dimension
                 std_scale = reshaped_std.expand(batch_size, -1, 1).clamp(min=0.001)
 
-            # Apply scaled adjustment
-            thresholds = thresholds * (1.0 + 0.1 * std_scale)
+            # Apply scaled adjustment - increased from 0.1 to 0.2 to make the threshold higher
+            thresholds = thresholds * (1.0 + 0.2 * std_scale)
+
+        # 在训练的开始阶段使用更高的阈值，随着训练进行逐渐降低
+        if hasattr(self, '_forward_count'):
+            early_training_factor = max(1.0, 3.0 - self._forward_count / 1000.0)
+            thresholds = thresholds * early_training_factor
 
         # Apply gating - zero out coefficients below threshold using differentiable operation
         # Use a smoother transition instead of hard thresholding for better gradients
         sigmoid_scale = 20.0  # Steepness of the sigmoid
         gating_mask = torch.sigmoid(sigmoid_scale * (torch.abs(coefficients) - thresholds))
         gated_coeffs = coefficients * gating_mask
+
+        # Store the actual gating mask for statistics
+        if self.training:
+            self.last_gating_mask = (torch.abs(coefficients) >= thresholds).float().detach()
 
         # For small debugging and numerical stability - ensure beta is used
         # This adds a tiny amount of beta-dependent noise that doesn't affect results
@@ -483,13 +494,48 @@ class AdaptiveGatingMetaNet(nn.Module):
         return total_loss + param_reg + 1e-6
 
     def get_gating_stats(self):
-        """Get statistics about the gating process
+        """Get statistics about the gating process for both training and evaluation
 
         Returns:
         ----------
         stats: dict
             Dictionary with gating statistics
         """
+        # In evaluation mode, we need to compute gating stats differently
+        if not self.training_mode:
+            # Generate some dummy data for computing gating stats
+            batch_size = 1
+            features = torch.randn(batch_size, self.feature_dim, device=self.log_base_threshold.device)
+
+            # Generate coefficients
+            with torch.no_grad():
+                if self.blockwise:
+                    coeffs = self.meta_net(features).reshape(batch_size, self.num_task_vectors, self.num_blocks)
+                else:
+                    coeffs = self.meta_net(features).reshape(batch_size, self.num_task_vectors, 1)
+
+                # Get threshold for evaluation
+                base_threshold = self.base_threshold
+                beta_val = self.beta
+                uncertainties = torch.ones_like(coeffs) * 0.5  # Default uncertainty
+                thresholds = base_threshold * (1.0 + beta_val * uncertainties)
+
+                # Compute gating mask
+                gating_mask = (torch.abs(coeffs) >= thresholds).float()
+                gating_ratio = gating_mask.mean().item()
+
+                return {
+                    "gating_ratio": gating_ratio,
+                    "avg_threshold": thresholds.mean().item(),
+                    "base_threshold": self.base_threshold.item(),
+                    "beta": self.beta.item(),
+                    "log_base_threshold": self.log_base_threshold.item(),
+                    "log_beta": self.log_beta.item(),
+                    "forward_count": self._forward_count if hasattr(self, '_forward_count') else 0,
+                    "reg_loss_count": self._reg_loss_count if hasattr(self, '_reg_loss_count') else 0,
+                }
+
+        # Return training mode stats if available
         if self.last_gated_coeffs is None:
             # Return default stats if no forward pass has been done
             return {
@@ -500,10 +546,8 @@ class AdaptiveGatingMetaNet(nn.Module):
                 "beta": self.beta.item(),
                 "log_base_threshold": self.log_base_threshold.item(),
                 "log_beta": self.log_beta.item(),
-                "forward_count": self._forward_count,
-                "reg_loss_count": self._reg_loss_count,
-                "beta_usage_counter": self.beta_usage_counter,
-                "threshold_usage_counter": self.threshold_usage_counter
+                "forward_count": self._forward_count if hasattr(self, '_forward_count') else 0,
+                "reg_loss_count": self._reg_loss_count if hasattr(self, '_reg_loss_count') else 0,
             }
 
         total_coeffs = self.last_gated_coeffs.numel()
@@ -521,8 +565,6 @@ class AdaptiveGatingMetaNet(nn.Module):
             "beta": self.beta.item(),
             "log_base_threshold": self.log_base_threshold.item(),
             "log_beta": self.log_beta.item(),
-            "forward_count": self._forward_count,
-            "reg_loss_count": self._reg_loss_count,
-            "beta_usage_counter": self.beta_usage_counter,
-            "threshold_usage_counter": self.threshold_usage_counter
+            "forward_count": self._forward_count if hasattr(self, '_forward_count') else 0,
+            "reg_loss_count": self._reg_loss_count if hasattr(self, '_reg_loss_count') else 0,
         }

@@ -164,8 +164,8 @@ def plot_validation_metrics(val_accuracies, base_threshold_values, beta_values,
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
 
     # Plot actual parameters
-    ax1.plot(epochs_range, base_threshold_values, 'r-o', linewidth=2, markersize=8, label='Base Threshold')
-    ax1.plot(epochs_range, beta_values, 'g-o', linewidth=2, markersize=8, label='Beta')
+    ax1.plot(epochs_range, base_threshold_values, 'r-o', linewidth=2, markersize=8, label='αT')
+    ax1.plot(epochs_range, beta_values, 'g-o', linewidth=2, markersize=8, label='β')
     ax1.set_ylabel('Parameter Value', fontsize=14)
     ax1.set_title(f'Gating Parameters Evolution for {dataset_name}', fontsize=16)
     ax1.legend(fontsize=12)
@@ -185,8 +185,8 @@ def plot_validation_metrics(val_accuracies, base_threshold_values, beta_values,
                 fontsize=10, color='green')
 
     # Plot log parameters
-    ax2.plot(epochs_range, log_base_threshold_values, 'r--o', linewidth=2, markersize=8, label='Log Base Threshold')
-    ax2.plot(epochs_range, log_beta_values, 'g--o', linewidth=2, markersize=8, label='Log Beta')
+    ax2.plot(epochs_range, log_base_threshold_values, 'r--o', linewidth=2, markersize=8, label='log(αT)')
+    ax2.plot(epochs_range, log_beta_values, 'g--o', linewidth=2, markersize=8, label='log(β)')
     ax2.set_xlabel('Epochs', fontsize=14)
     ax2.set_ylabel('Log Parameter Value', fontsize=14)
     ax2.set_title(f'Log Gating Parameters Evolution for {dataset_name}', fontsize=16)
@@ -214,11 +214,11 @@ def plot_gradients(grad_magnitudes, dataset_name, plot_dir):
 
     # Extract and plot log base threshold gradients
     log_base_grads = [g.get('log_base', 0) for g in grad_magnitudes]
-    plt.plot(iterations, log_base_grads, 'r-', linewidth=1.5, label='Log Base Threshold Gradient')
+    plt.plot(iterations, log_base_grads, 'r-', linewidth=1.5, label='log(αT) Gradient')
 
     # Extract and plot log beta gradients
     log_beta_grads = [g.get('log_beta', 0) for g in grad_magnitudes]
-    plt.plot(iterations, log_beta_grads, 'g-', linewidth=1.5, label='Log Beta Gradient')
+    plt.plot(iterations, log_beta_grads, 'g-', linewidth=1.5, label='log(β) Gradient')
 
     plt.xlabel('Iterations', fontsize=14)
     plt.ylabel('Gradient Magnitude', fontsize=14)
@@ -266,8 +266,8 @@ def main(rank, args):
     if hasattr(args, 'datasets') and args.datasets:
         datasets_to_process = args.datasets
     else:
-        # datasets_to_process = ["Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SUN397", "SVHN"]
-        datasets_to_process = ["Cars"]
+        datasets_to_process = ["Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SUN397", "SVHN"]
+        # datasets_to_process = ["Cars"]
 
     # Fix save directory path
     if not hasattr(args, 'save') or args.save is None:
@@ -297,9 +297,8 @@ def main(rank, args):
     if rank == 0:
         print(f"\n=== Training Configuration ===")
         print(f"Model: {args.model}")
-        print(f"Using blockwise coefficients: {args.blockwise_coef}")
-        print(f"Base threshold: {args.base_threshold}")
-        print(f"Beta: {args.beta}")
+        print(f"Blockwise coefficients: {args.blockwise_coef}")
+        print(f"Initial αT: {args.base_threshold:.4f}, β: {args.beta:.4f}")
         print(f"Uncertainty regularization: {args.uncertainty_reg}")
         print(f"Causal intervention: {args.causal_intervention if hasattr(args, 'causal_intervention') else False}")
         print(f"Batch size: {args.batch_size}")
@@ -390,7 +389,7 @@ def main(rank, args):
                     ddp_model = torch.nn.parallel.DistributedDataParallel(
                         model,
                         device_ids=[args.rank],
-                        find_unused_parameters=True  # Important for log parameters
+                        find_unused_parameters=False  # Changed to False to fix warning
                     )
                 except Exception as e:
                     if is_main_process():
@@ -474,6 +473,9 @@ def main(rank, args):
                 epoch_reg_loss = 0.0
                 batch_count = 0
 
+                if is_main_process():
+                    print(f"\nEpoch {epoch+1}/{num_epochs} - Training")
+
                 for i, batch in enumerate(ddp_loader):
                     start_time = time.time()
 
@@ -501,7 +503,7 @@ def main(rank, args):
                         # Backward pass
                         scaler.scale(total_loss).backward()
 
-                        # Check log parameters' gradients
+                        # Check log parameters' gradients (only for periodic logging)
                         if is_main_process() and i % print_every == 0:
                             # Get original model reference
                             if isinstance(ddp_model, torch.nn.parallel.DistributedDataParallel):
@@ -513,11 +515,7 @@ def main(rank, args):
                             log_base_grad = model_ref.log_base_threshold.grad
                             log_beta_grad = model_ref.log_beta.grad
 
-                            # Print gradients
-                            print(f"Log Base Threshold grad: {log_base_grad.item() if log_base_grad is not None else 'None'}")
-                            print(f"Log Beta grad: {log_beta_grad.item() if log_beta_grad is not None else 'None'}")
-
-                            # Save gradient information
+                            # Save gradient information for later plotting
                             grad_magnitudes.append({
                                 'log_base': log_base_grad.item() if log_base_grad is not None else 0.0,
                                 'log_beta': log_beta_grad.item() if log_beta_grad is not None else 0.0
@@ -540,7 +538,7 @@ def main(rank, args):
                             train_losses.append(task_loss_cpu)
                             reg_losses.append(reg_loss_cpu)
 
-                        # Print progress
+                        # Print progress (only with reduced frequency)
                         if i % print_every == 0 and is_main_process():
                             # Get original model reference
                             if isinstance(ddp_model, torch.nn.parallel.DistributedDataParallel):
@@ -551,28 +549,22 @@ def main(rank, args):
                             # Get current gating parameters
                             current_base_threshold = float(model_ref.base_threshold.item())
                             current_beta = float(model_ref.beta.item())
-                            current_log_base_threshold = float(model_ref.log_base_threshold.item())
-                            current_log_beta = float(model_ref.log_beta.item())
-
-                            # Log parameter values
-                            print(f"Epoch {epoch+1}/{num_epochs}, Batch {i}/{num_batches}, "
-                                  f"Loss: {task_loss_cpu:.6f}, Reg Loss: {reg_loss_cpu:.6f}, "
-                                  f"Time: {time.time() - start_time:.3f}s")
-                            print(f"Parameters - Base threshold: {current_base_threshold:.8f}, Beta: {current_beta:.8f}")
-                            print(f"Log Parameters - log_base_threshold: {current_log_base_threshold:.8f}, log_beta: {current_log_beta:.8f}")
 
                             # Get gating statistics if available
+                            gating_ratio = 0.0
                             if hasattr(model_ref, 'get_gating_stats'):
                                 stats = model_ref.get_gating_stats()
                                 if stats:
                                     gating_stats.append(stats)
-                                    print(f"Gating ratio: {stats['gating_ratio']:.3f}, "
-                                          f"Avg threshold: {stats['avg_threshold']:.4f}")
+                                    gating_ratio = stats.get('gating_ratio', 0.0)
+
+                            # Compact, single-line progress output with shortened elapsed time
+                            t_elapsed = time.time() - start_time
+                            print(f"  Batch {i:4d}/{num_batches:4d} | Loss: {task_loss_cpu:.4f} | Reg: {reg_loss_cpu:.4f} | αT: {current_base_threshold:.4f} | β: {current_beta:.4f} | Gate: {gating_ratio:.3f} | t: {t_elapsed:.2f}s")
 
                     except Exception as e:
                         if is_main_process():
-                            print(f"Error in training batch: {e}")
-                            traceback.print_exc()
+                            print(f"  Error in batch {i}: {e}")
                         # Skip this batch but continue training
                         continue
 
@@ -600,13 +592,13 @@ def main(rank, args):
                     log_base_threshold_values.append(current_log_base_threshold)
                     log_beta_values.append(current_log_beta)
 
-                    print(f"Epoch {epoch+1} average - Task Loss: {avg_epoch_loss:.6f}, "
-                          f"Reg Loss: {avg_epoch_reg_loss:.6f}")
-                    print(f"Parameters - Base threshold: {current_base_threshold:.8f}, Beta: {current_beta:.8f}")
-                    print(f"Log Parameters - log_base_threshold: {current_log_base_threshold:.8f}, log_beta: {current_log_beta:.8f}")
+                    # Epoch summary
+                    print(f"  Summary: Task Loss: {avg_epoch_loss:.4f} | Reg Loss: {avg_epoch_reg_loss:.4f} | αT: {current_base_threshold:.4f} | β: {current_beta:.4f}")
 
                 # Evaluate on validation set
                 if is_main_process():
+                    print(f"Epoch {epoch+1}/{num_epochs} - Validation")
+
                     # Create a combined model for evaluation
                     class CombinedModel(torch.nn.Module):
                         def __init__(self, feature_model, classifier):
@@ -644,9 +636,7 @@ def main(rank, args):
                     val_acc = correct / total
                     val_accuracies.append(val_acc)
 
-                    print(f"Epoch {epoch+1}/{num_epochs}, "
-                          f"Avg Loss: {avg_epoch_loss:.6f}, "
-                          f"Val Acc: {val_acc*100:.2f}%")
+                    print(f"  Accuracy: {val_acc*100:.2f}% ({correct}/{total})")
 
                     # Save best model
                     if val_acc > best_acc:
@@ -679,6 +669,8 @@ def main(rank, args):
                             'acc': val_acc,
                             'config': config
                         }
+
+                        print(f"  New best model! αT: {current_base_threshold:.4f}, β: {current_beta:.4f}")
 
             # Save results
             if is_main_process():
@@ -730,10 +722,7 @@ def main(rank, args):
                 plot_gradients(grad_magnitudes, dataset_name, plot_dir)
 
                 print(f"Training completed for {dataset_name}. Best validation accuracy: {best_acc*100:.2f}%")
-                print(f"Final parameters - Base threshold: {base_threshold_values[-1]:.8f}, "
-                      f"Beta: {beta_values[-1]:.8f}")
-                print(f"Final log parameters - Log Base: {log_base_threshold_values[-1]:.8f}, "
-                      f"Log Beta: {log_beta_values[-1]:.8f}")
+                print(f"Final parameters - αT: {base_threshold_values[-1]:.4f}, β: {beta_values[-1]:.4f}")
 
         except Exception as e:
             if is_main_process():
