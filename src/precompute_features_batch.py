@@ -20,6 +20,11 @@ import gc
 import signal
 from datetime import datetime
 from tqdm import tqdm
+from PIL import Image, ImageFile
+
+# Tell PIL to be more lenient with corrupted files
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 from src.modeling import ImageEncoder
 from src.datasets.registry import get_dataset
 
@@ -57,7 +62,7 @@ def memory_cleanup(force_gc=False):
             log_debug(f"GPU memory: {torch.cuda.memory_allocated() / (1024 ** 3):.2f} GB allocated, "
                       f"{torch.cuda.memory_reserved() / (1024 ** 3):.2f} GB reserved")
 
-def extract_features_safely(model, loader, features_path, labels_path, batch_timeout=30):
+def extract_features_safely(model, loader, features_path, labels_path, batch_timeout=30, max_retries=2):
     """
     Extract features from a data loader with enhanced safety measures
 
@@ -67,6 +72,7 @@ def extract_features_safely(model, loader, features_path, labels_path, batch_tim
         features_path: Path to save features
         labels_path: Path to save labels
         batch_timeout: Timeout in seconds for processing each batch
+        max_retries: Maximum number of retries for failed batches
     """
     global current_batch, processing_start_time
 
@@ -77,61 +83,111 @@ def extract_features_safely(model, loader, features_path, labels_path, batch_tim
     all_features = []
     all_labels = []
 
-    # Start monitoring
-    processing_start_time = time.time()
+    # Check for partial results to resume from
+    partial_path = features_path + ".partial"
+    if os.path.exists(partial_path):
+        try:
+            log_info(f"Found partial results at {partial_path}, attempting to load...")
+            partial_features = torch.load(partial_path)
+            log_info(f"Loaded {len(partial_features)} partial features, will resume extraction")
+            all_features = [partial_features]
 
-    log_info(f"Starting feature extraction with {len(loader)} batches")
-    log_info(f"Saving features to {features_path}")
+            # Try to load partial labels too
+            partial_labels_path = labels_path + ".partial"
+            if os.path.exists(partial_labels_path):
+                partial_labels = torch.load(partial_labels_path)
+                all_labels = [partial_labels]
+                log_info(f"Loaded {len(partial_labels)} partial labels")
+        except Exception as e:
+            log_info(f"Error loading partial results: {e}")
+            # Continue without partial results
 
     try:
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(loader, desc="Extracting features")):
                 current_batch = batch_idx
+
+                # If we're resuming and already have partial results, skip appropriate number of batches
+                if all_features and batch_idx * loader.batch_size < len(all_features[0]):
+                    if batch_idx % 50 == 0:
+                        log_debug(f"Skipping batch {batch_idx} (already processed)")
+                    continue
+
                 log_debug(f"Processing batch {batch_idx}/{len(loader)}")
 
                 batch_start = time.time()
+                retry_count = 0
+                success = False
 
-                # Handle different batch formats
-                if isinstance(batch, dict):
-                    images = batch["images"].to(device)
-                    labels = batch["labels"]
-                else:
-                    images, labels = batch
-                    images = images.to(device)
+                while not success and retry_count <= max_retries:
+                    try:
+                        # Handle different batch formats
+                        if isinstance(batch, dict):
+                            images = batch["images"].to(device)
+                            labels = batch["labels"]
+                        else:
+                            images, labels = batch
+                            images = images.to(device)
 
-                # Extract features in smaller chunks if batch is large
-                chunk_size = 16  # Process in smaller chunks to reduce memory pressure
-                batch_features = []
+                        # Process in smaller chunks if batch is large
+                        chunk_size = 8 if retry_count > 0 else 16  # Reduce chunk size on retry
+                        batch_features = []
 
-                for i in range(0, images.size(0), chunk_size):
-                    chunk = images[i:i + chunk_size]
-                    chunk_features = model(chunk)
-                    batch_features.append(chunk_features.cpu())
+                        for i in range(0, images.size(0), chunk_size):
+                            chunk = images[i:i + chunk_size]
+                            chunk_features = model(chunk)
+                            batch_features.append(chunk_features.cpu())
 
-                    # Release memory immediately after each chunk
-                    torch.cuda.empty_cache()
+                            # Force sync to detect OOM errors early
+                            torch.cuda.synchronize()
 
-                # Combine chunks
-                batch_features = torch.cat(batch_features, dim=0)
+                            # Release memory immediately
+                            torch.cuda.empty_cache()
 
-                # Add to collection
-                all_features.append(batch_features)
-                all_labels.append(labels)
+                        # Combine chunks
+                        batch_features = torch.cat(batch_features, dim=0)
+
+                        # Add to collection
+                        all_features.append(batch_features)
+                        all_labels.append(labels)
+
+                        success = True
+
+                    except RuntimeError as e:
+                        # Check if it's an OOM error
+                        if "out of memory" in str(e).lower():
+                            retry_count += 1
+                            log_info(f"OOM error on batch {batch_idx}, retry {retry_count}/{max_retries}")
+
+                            # Aggressive cleanup
+                            memory_cleanup(True)
+
+                            if retry_count <= max_retries:
+                                # Wait before retrying
+                                time.sleep(2)
+                                continue
+
+                        # If not OOM or out of retries, re-raise
+                        raise
+
+                # Break if we couldn't process this batch after retries
+                if not success:
+                    log_info(f"Failed to process batch {batch_idx} after {max_retries} retries, stopping extraction")
+                    break
 
                 # Log the batch processing time
                 batch_time = time.time() - batch_start
                 log_debug(f"Batch {batch_idx} processed in {batch_time:.2f}s")
 
-                # Aggressive cleanup every few batches
+                # Aggressive cleanup every 5 batches
                 if batch_idx % 5 == 0:
                     memory_cleanup(force_gc=True)
                     log_debug("Performed aggressive memory cleanup")
 
-                # Save intermediate results every 50 batches
-                if batch_idx > 0 and batch_idx % 50 == 0:
+                # Save intermediate results every 25 batches
+                if batch_idx > 0 and (batch_idx % 25 == 0 or batch_idx == len(loader) - 1):
                     log_info(f"Saving intermediate results at batch {batch_idx}")
                     try:
-                        # Save intermediate features
                         interim_features = torch.cat(all_features, dim=0)
                         interim_labels = torch.cat(all_labels, dim=0) if all_labels[0] is not None else None
 
@@ -155,6 +211,12 @@ def extract_features_safely(model, loader, features_path, labels_path, batch_tim
         if all_labels is not None:
             log_info(f"Saving {len(all_labels)} labels to {labels_path}")
             torch.save(all_labels, labels_path)
+
+        # Clean up partial files if successful
+        if os.path.exists(features_path + ".partial"):
+            os.remove(features_path + ".partial")
+        if os.path.exists(labels_path + ".partial"):
+            os.remove(labels_path + ".partial")
 
         log_info(f"Feature extraction complete. Shape: {all_features.shape}")
         return True
@@ -187,7 +249,7 @@ def extract_features_safely(model, loader, features_path, labels_path, batch_tim
         memory_cleanup(force_gc=True)
         log_info("Feature extraction function complete")
 
-def extract_and_save_features(model, dataset_name, save_dir, data_location, batch_size, batch_timeout=60, gpu_id=0, num_augmentations=0):
+def extract_and_save_features(model, dataset_name, save_dir, data_location, batch_size, batch_timeout=60, gpu_id=0, num_augmentations=0, start_augmentation=1):
     """Process a single dataset with robust error handling and optional data augmentation
 
     Args:
@@ -199,6 +261,7 @@ def extract_and_save_features(model, dataset_name, save_dir, data_location, batc
         batch_timeout: Timeout in seconds for each batch
         gpu_id: GPU ID to use
         num_augmentations: Number of augmented versions to create (default: 0)
+        start_augmentation: Starting index for augmentation (default: 1)
     """
     global processing_start_time
 
@@ -217,12 +280,11 @@ def extract_and_save_features(model, dataset_name, save_dir, data_location, batc
         log_info("Warning: CUDA not available, using CPU instead")
 
     try:
-        # Special handling for SUN397
-        if dataset_name == "SUN397":
-            log_info("Using special handling for SUN397 dataset")
-            # Reduce batch size for SUN397 to prevent memory issues
+        # For large datasets like SUN397, reduce batch size to prevent memory issues
+        if dataset_name == "SUN397" or dataset_name == "SUN397Val":
+            log_info(f"Processing {dataset_name} with reduced batch size")
             batch_size = max(16, batch_size // 2)
-            log_info(f"Reduced batch size to {batch_size} for SUN397")
+            log_info(f"Using batch size {batch_size} for {dataset_name}")
 
         # Use validation preprocessing (no random augmentations) for the standard features
         val_preprocess = model.val_preprocess
@@ -232,22 +294,47 @@ def extract_and_save_features(model, dataset_name, save_dir, data_location, batc
 
         # Get datasets for different preprocessing methods
         log_info(f"Loading dataset {dataset_name}Val with validation preprocessing...")
-        train_val_dataset = get_dataset(
-            dataset_name + "Val",
-            val_preprocess,
-            location=data_location,
-            batch_size=batch_size,
-            num_workers=2,  # Reduced worker count for stability
-        )
+        try:
+            train_val_dataset = get_dataset(
+                dataset_name + "Val",
+                val_preprocess,
+                location=data_location,
+                batch_size=batch_size,
+                num_workers=2,  # Reduced worker count for stability
+            )
+        except Exception as e:
+            log_info(f"Error loading {dataset_name}Val dataset: {e}")
+            log_info(f"Will try alternative loading approaches")
+            train_val_dataset = None
+
+        # If we couldn't load the Val variant, try the base dataset
+        if train_val_dataset is None:
+            try:
+                log_info(f"Loading dataset {dataset_name} as fallback...")
+                train_val_dataset = get_dataset(
+                    dataset_name,
+                    val_preprocess,
+                    location=data_location,
+                    batch_size=batch_size,
+                    num_workers=2,
+                )
+            except Exception as e:
+                log_info(f"Error loading {dataset_name} dataset as fallback: {e}")
+                raise RuntimeError(f"Could not load dataset {dataset_name} in any variant")
 
         log_info(f"Loading dataset {dataset_name} with validation preprocessing...")
-        test_dataset = get_dataset(
-            dataset_name,
-            val_preprocess,
-            location=data_location,
-            batch_size=batch_size,
-            num_workers=2,  # Reduced worker count for stability
-        )
+        try:
+            test_dataset = get_dataset(
+                dataset_name,
+                val_preprocess,
+                location=data_location,
+                batch_size=batch_size,
+                num_workers=2,  # Reduced worker count for stability
+            )
+        except Exception as e:
+            log_info(f"Error loading test dataset {dataset_name}: {e}")
+            log_info(f"Using train dataset as test dataset")
+            test_dataset = train_val_dataset
 
         # Create save directories
         save_dir_train_val = os.path.join(save_dir, dataset_name + "Val")
@@ -262,79 +349,105 @@ def extract_and_save_features(model, dataset_name, save_dir, data_location, batc
             with open(os.path.join(save_dir_test, "classnames.txt"), "w") as f:
                 f.write("\n".join(test_dataset.classnames))
 
-        # Extract features with progressive timeouts
-        # Use longer timeouts for larger datasets
+        # Check if we need to extract standard features
+        standard_features_path = os.path.join(save_dir_train_val, "train_features.pt")
+        standard_features_exist = os.path.exists(standard_features_path)
+
+        # Calculate timeout based on dataset size - do this outside the conditional block
+        # so it's available for both standard features and augmentations
         train_size = len(train_val_dataset.train_loader.dataset)
         log_info(f"Training set size: {train_size}")
-
-        # Adjust batch timeout based on dataset size
         adjusted_timeout = min(batch_timeout * (train_size / 5000), 300)  # Max 5 minutes per batch
-        log_info(f"Using batch timeout of {adjusted_timeout:.1f}s for training set")
+        log_info(f"Using batch timeout of {adjusted_timeout:.1f}s for extraction")
 
-        # First extract standard features with validation preprocessing
-        log_info("Extracting standard validation features...")
-        extract_features_safely(
-            model,
-            train_val_dataset.train_loader,
-            os.path.join(save_dir_train_val, "train_features.pt"),
-            os.path.join(save_dir_train_val, "train_labels.pt"),
-            batch_timeout=adjusted_timeout
-        )
-        memory_cleanup(force_gc=True)
+        if not standard_features_exist or num_augmentations == 0:
+            if not standard_features_exist:
+                # First extract standard features with validation preprocessing
+                log_info("Extracting standard training features...")
+                extract_features_safely(
+                    model,
+                    train_val_dataset.train_loader,
+                    os.path.join(save_dir_train_val, "train_features.pt"),
+                    os.path.join(save_dir_train_val, "train_labels.pt"),
+                    batch_timeout=adjusted_timeout,
+                    max_retries=3  # More retries for robustness
+                )
+                memory_cleanup(force_gc=True)
+                time.sleep(2)  # Wait a moment before next extraction
 
-        log_info("Extracting validation features...")
-        extract_features_safely(
-            model,
-            train_val_dataset.test_loader,
-            os.path.join(save_dir_train_val, "val_features.pt"),
-            os.path.join(save_dir_train_val, "val_labels.pt"),
-            batch_timeout=adjusted_timeout
-        )
-        memory_cleanup(force_gc=True)
+                log_info("Extracting validation features...")
+                extract_features_safely(
+                    model,
+                    train_val_dataset.test_loader,
+                    os.path.join(save_dir_train_val, "val_features.pt"),
+                    os.path.join(save_dir_train_val, "val_labels.pt"),
+                    batch_timeout=adjusted_timeout,
+                    max_retries=3
+                )
+                memory_cleanup(force_gc=True)
+                time.sleep(2)  # Wait a moment before next extraction
 
-        log_info("Extracting test features...")
-        extract_features_safely(
-            model,
-            test_dataset.test_loader,
-            os.path.join(save_dir_test, "test_features.pt"),
-            os.path.join(save_dir_test, "test_labels.pt"),
-            batch_timeout=adjusted_timeout
-        )
-        memory_cleanup(force_gc=True)
+                log_info("Extracting test features...")
+                extract_features_safely(
+                    model,
+                    test_dataset.test_loader,
+                    os.path.join(save_dir_test, "test_features.pt"),
+                    os.path.join(save_dir_test, "test_labels.pt"),
+                    batch_timeout=adjusted_timeout,
+                    max_retries=3
+                )
+                memory_cleanup(force_gc=True)
+                time.sleep(2)  # Wait a moment before augmentations
 
         # Now extract augmented features if requested
         if num_augmentations > 0:
-            log_info(f"Generating {num_augmentations} augmented feature versions...")
+            end_augmentation = start_augmentation + num_augmentations
+            log_info(f"Generating augmented feature versions from {start_augmentation} to {end_augmentation-1}...")
 
-            # Create dataset with training preprocessing (random augmentations)
-            for aug_idx in range(1, num_augmentations + 1):
-                log_info(f"Creating augmented version {aug_idx}/{num_augmentations}")
+            for aug_idx in range(start_augmentation, end_augmentation):
+                aug_features_path = os.path.join(save_dir_train_val, f"train_features_aug{aug_idx}.pt")
+
+                # Skip if this augmentation already exists
+                if os.path.exists(aug_features_path):
+                    log_info(f"Augmented version {aug_idx} already exists, skipping")
+                    continue
+
+                log_info(f"Creating augmented version {aug_idx}")
 
                 # Load dataset with train_preprocess for random augmentations
                 log_info(f"Loading dataset {dataset_name}Val with training preprocessing for augmentation {aug_idx}...")
-                aug_train_val_dataset = get_dataset(
-                    dataset_name + "Val",
-                    train_preprocess,
-                    location=data_location,
-                    batch_size=batch_size,
-                    num_workers=2,
-                )
+                try:
+                    aug_train_val_dataset = get_dataset(
+                        dataset_name + "Val",
+                        train_preprocess,
+                        location=data_location,
+                        batch_size=batch_size,
+                        num_workers=2,
+                    )
 
-                # Extract augmented training features
-                log_info(f"Extracting augmented training features (version {aug_idx})...")
-                aug_features_path = os.path.join(save_dir_train_val, f"train_features_aug{aug_idx}.pt")
-                aug_labels_path = os.path.join(save_dir_train_val, f"train_labels_aug{aug_idx}.pt")
+                    # Extract augmented training features
+                    log_info(f"Extracting augmented training features (version {aug_idx})...")
+                    aug_labels_path = os.path.join(save_dir_train_val, f"train_labels_aug{aug_idx}.pt")
 
-                extract_features_safely(
-                    model,
-                    aug_train_val_dataset.train_loader,
-                    aug_features_path,
-                    aug_labels_path,
-                    batch_timeout=adjusted_timeout
-                )
-                memory_cleanup(force_gc=True)
+                    extract_features_safely(
+                        model,
+                        aug_train_val_dataset.train_loader,
+                        aug_features_path,
+                        aug_labels_path,
+                        batch_timeout=adjusted_timeout,  # 使用前面定义的调整后的超时时间
+                        max_retries=3  # More retries for augmentation
+                    )
+                    memory_cleanup(force_gc=True)
 
-                log_info(f"Completed augmented version {aug_idx}")
+                    # Wait between augmentations
+                    time.sleep(5)
+
+                    log_info(f"Completed augmented version {aug_idx}")
+                except Exception as aug_error:
+                    log_info(f"Error processing augmentation {aug_idx}: {aug_error}")
+                    traceback.print_exc()
+                    # Continue with next augmentation
+                    continue
 
         log_info(f"Completed processing {dataset_name}")
         return True
@@ -377,6 +490,8 @@ def parse_args():
                         help="OpenCLIP cache directory")
     parser.add_argument("--num-augmentations", type=int, default=0,
                         help="Number of augmented versions to create (0 for none)")
+    parser.add_argument("--start-augmentation", type=int, default=1,
+                        help="Starting index for augmentation (default: 1)")
     return parser.parse_args()
 
 def main():
@@ -427,7 +542,8 @@ def main():
         batch_size=args.batch_size,
         batch_timeout=args.batch_timeout,
         gpu_id=args.gpu_id,
-        num_augmentations=args.num_augmentations
+        num_augmentations=args.num_augmentations,
+        start_augmentation=args.start_augmentation
     )
 
     if success:

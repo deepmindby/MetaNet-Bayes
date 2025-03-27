@@ -373,8 +373,11 @@ def main(rank, args):
     if hasattr(args, 'datasets') and args.datasets:
         datasets_to_process = args.datasets
     else:
+        # Cars lr=0.01 *50
+        # DTD,EuroSAT  lr=0.0005 *50
+        # sun397 lr=0.0005 72.49
         # datasets_to_process = ["Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SUN397", "SVHN"]
-        datasets_to_process = ["Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SVHN"]
+        datasets_to_process = ["SUN397"]
 
     # Fix path logic to avoid duplicating MetaNet-Bayes
     if not hasattr(args, 'save') or args.save is None:
@@ -828,7 +831,7 @@ def main(rank, args):
                 # Create plot for gradient magnitudes
                 plot_gradients(grad_magnitudes, dataset_name, plot_dir)
 
-                print(f"Training completed for {dataset_name}. Best validation accuracy: {best_acc*100:.2f}%")
+                print(f"Training completed for {dataset_name}. Best validation accuracy: {best_acc*50:.2f}%")
                 print(f"Final parameters - αT: {base_threshold_values[-1]:.4f}, β: {beta_values[-1]:.4f}")
 
         except Exception as e:

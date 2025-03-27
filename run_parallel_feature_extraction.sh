@@ -2,13 +2,13 @@
 
 # 更健壮的批处理特征提取脚本
 # 优化资源使用和错误处理
-# 增加随机增强支持
+# 统一处理所有数据集
 
 # 设置基本参数
 SAVE_DIR="/home/haichao/zby/MetaNet-Bayes/precomputed_features"
 DATA_LOCATION="/home/haichao/zby/MetaNet-Bayes/data"
 MODEL="ViT-B-32"
-BATCH_SIZE=128  # 降低批次大小提高稳定性
+BATCH_SIZE=64  # 通用批次大小
 TIME_LIMITS=36000
 NUM_AUGMENTATIONS=10  # 每个数据集创建的增强版本数量
 
@@ -19,9 +19,9 @@ echo "检测到 $GPU_COUNT 个可用GPU"
 # 确保保存目录存在
 mkdir -p $SAVE_DIR
 
-# 定义数据集列表
-# DATASETS="Cars DTD EuroSAT GTSRB MNIST RESISC45 SVHN"
-DATASETS="GTSRB MNIST RESISC45 SVHN"
+# 定义数据集列表 - 所有数据集统一处理
+# DATASETS="Cars DTD EuroSAT GTSRB MNIST RESISC45 SVHN SUN397"
+DATASETS="SUN397"
 
 # 创建日志目录
 LOG_DIR="${SAVE_DIR}/logs"
@@ -62,7 +62,7 @@ BATCH_SIZES=(
     ["GTSRB"]=$BATCH_SIZE
     ["MNIST"]=$BATCH_SIZE
     ["RESISC45"]=$BATCH_SIZE
-    ["SUN397"]=$BATCH_SIZE
+    ["SUN397"]=$((BATCH_SIZE/4))  # SUN397使用较小的批次以防OOM
     ["SVHN"]=$BATCH_SIZE
 )
 
@@ -92,7 +92,7 @@ for i in {0..7}; do
 
     echo "处理数据集 $DATASET 在 GPU $GPU_ID，创建 $NUM_AUGMENTATIONS 个增强版本，日志: $LOG_FILE"
 
-    # 使用timeout命令设置整体超时，并在后台运行
+    # 标准处理 - 所有数据集使用统一方法
     (
         timeout $TIMEOUT python src/precompute_features_batch.py \
             --model $MODEL \
@@ -120,34 +120,6 @@ done
 
 # 等待所有后台任务完成
 wait
-
-# 处理SUN397数据集
-echo "处理SUN397数据集，创建 $NUM_AUGMENTATIONS 个增强版本..."
-LOG_FILE="${LOG_DIR}/SUN397_$(date +%Y%m%d_%H%M%S).log"
-
-# 计算GPU ID - 使用0号GPU，或者最后一个可用的GPU
-if [ $GPU_COUNT -gt 0 ]; then
-    GPU_ID=0
-else
-    GPU_ID=0
-fi
-
-(
-    timeout $TIMEOUT python src/precompute_features_sun397.py \
-        --model $MODEL \
-        --save-dir $SAVE_DIR \
-        --data-location $DATA_LOCATION \
-        --batch-size $((BATCH_SIZE/2)) \
-        --num-augmentations $NUM_AUGMENTATIONS > $LOG_FILE 2>&1
-
-    # 检查退出状态
-    EXIT_CODE=$?
-    if [ $EXIT_CODE -eq 124 ]; then
-        echo "警告: 处理 SUN397 超时" >> $LOG_FILE
-    elif [ $EXIT_CODE -ne 0 ]; then
-        echo "错误: 处理 SUN397 失败，代码 $EXIT_CODE" >> $LOG_FILE
-    fi
-)
 
 echo "所有特征计算完成！"
 echo "清理剩余资源..."
