@@ -163,6 +163,12 @@ def parse_arguments():
         default=False,
         help="Enable debug mode with additional logging"
     )
+    parser.add_argument(
+        "--no-metanet",
+        action="store_true",
+        default=False,
+        help="Remove MetaNet and use original Atlas implementation with precomputed features"
+    )
 
     parsed_args = parser.parse_args()
     parsed_args.device = "cuda" if torch.cuda.is_available() else "cpu"
