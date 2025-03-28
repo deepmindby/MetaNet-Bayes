@@ -1,7 +1,7 @@
-"""Training Script Using Adaptive Gating MetaNet with Pre-computed Features
+"""Optimized Training Script Using Pre-computed Features
 
-This script trains MetaNet models with adaptive gating mechanism using pre-computed
-CLIP features, supporting augmented feature versions for improved performance.
+This script provides an optimized approach to training models using pre-computed
+CLIP features with a clean and direct path handling strategy.
 """
 
 import os
@@ -13,17 +13,238 @@ import numpy as np
 import matplotlib.pyplot as plt
 from torch.cuda.amp import GradScaler
 import gc
-import sys
 import traceback
-from datetime import datetime, timedelta
-
-# 定义关闭门控使用的极小阈值
-NO_GATING_THRESHOLD = 1e-6
+from datetime import datetime
 
 from src.adaptive_gating_metanet import AdaptiveGatingMetaNet
 from src.utils import cosine_lr
 from src.datasets.common import maybe_dictionarize
 from src.distributed import cleanup_ddp, distribute_loader, is_main_process, setup_ddp
+
+from src.args import parse_arguments
+args = parse_arguments()
+
+
+class PrecomputedFeatureDataset(torch.utils.data.Dataset):
+    """Dataset for precomputed features with augmentation support"""
+
+    def __init__(self, features_path, labels_path, verbose=False,
+                 augmentation_paths=None, use_augmentation=True):
+        """
+        Initialize dataset with paths to precomputed features and labels
+
+        Args:
+            features_path: Path to precomputed features tensor
+            labels_path: Path to labels tensor
+            verbose: Whether to print detailed logs
+            augmentation_paths: List of paths to augmented feature/label pairs
+            use_augmentation: Whether to use augmented versions when available
+        """
+        super().__init__()
+
+        # Store augmentation settings
+        self.training = True  # Default to training mode
+        self.use_augmentation = use_augmentation
+        self.augmentation_paths = []
+        if augmentation_paths is not None:
+            self.augmentation_paths = augmentation_paths
+
+        # Load base features and labels
+        try:
+            self.features = torch.load(features_path)
+            # if verbose:
+            #     print(f"Successfully loaded features from {features_path}, shape: {self.features.shape}")
+        except Exception as e:
+            print(f"Error loading features from {features_path}: {e}")
+            traceback.print_exc()
+            raise RuntimeError(f"Failed to load features from {features_path}: {e}")
+
+        try:
+            self.labels = torch.load(labels_path)
+            # if verbose:
+            #     print(f"Successfully loaded labels from {labels_path}, shape: {self.labels.shape}")
+        except Exception as e:
+            print(f"Error loading labels from {labels_path}: {e}")
+            traceback.print_exc()
+            raise RuntimeError(f"Failed to load labels from {labels_path}: {e}")
+
+        # Validate that features and labels have matching sizes
+        if len(self.features) != len(self.labels):
+            raise ValueError(f"Features ({len(self.features)}) and labels ({len(self.labels)}) count mismatch")
+
+        # Load augmented versions if provided
+        self.augmented_features = []
+        self.augmented_labels = []
+
+        if augmentation_paths and use_augmentation:
+            for aug_idx, (aug_feat_path, aug_label_path) in enumerate(augmentation_paths):
+                if os.path.exists(aug_feat_path) and os.path.exists(aug_label_path):
+                    try:
+                        aug_features = torch.load(aug_feat_path)
+                        aug_labels = torch.load(aug_label_path)
+
+                        # Verify shapes match original features
+                        if aug_features.shape == self.features.shape and aug_labels.shape == self.labels.shape:
+                            self.augmented_features.append(aug_features)
+                            self.augmented_labels.append(aug_labels)
+                            # if verbose:
+                            #     print(f"Loaded augmented version {aug_idx + 1} from {aug_feat_path}")
+                        else:
+                            print(f"Warning: Augmented version {aug_idx + 1} has mismatched shape, skipping")
+                    except Exception as e:
+                        print(f"Error loading augmented version {aug_idx + 1}: {e}")
+                        if verbose:
+                            traceback.print_exc()
+
+            # if verbose:
+            #     print(f"Loaded {len(self.augmented_features)} augmented versions")
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        # During training, randomly choose from augmented versions if available
+        if self.training and self.augmented_features and self.use_augmentation and random.random() > 0.2:
+            # 80% chance to use augmented features
+            aug_idx = random.randint(0, len(self.augmented_features) - 1)
+            return {
+                "features": self.augmented_features[aug_idx][idx],
+                "labels": self.augmented_labels[aug_idx][idx],
+                "index": idx,
+                "augmented": True
+            }
+        else:
+            # Use original features or when evaluating
+            return {
+                "features": self.features[idx],
+                "labels": self.labels[idx],
+                "index": idx,
+                "augmented": False
+            }
+
+    def train(self, mode=True):
+        """Sets the dataset in training mode (will use augmentations)"""
+        self.training = mode
+        return self
+
+
+class PrecomputedFeatures:
+    """Dataset container class for precomputed features with augmentation support"""
+
+    def __init__(self,
+                 feature_dir,
+                 batch_size=128,
+                 num_workers=8,
+                 persistent_workers=False,
+                 use_augmentation=True,
+                 max_augmentations=None):
+        """
+        Initialize with directory containing precomputed features
+
+        Args:
+            feature_dir: Path to directory with precomputed features
+            batch_size: Batch size for dataloaders
+            num_workers: Number of worker threads for dataloaders
+            persistent_workers: Whether to keep worker processes alive
+            use_augmentation: Whether to use augmentations during training
+            max_augmentations: Maximum number of augmentations to load (None for all)
+        """
+        # Verify directory exists
+        if not os.path.exists(feature_dir):
+            raise FileNotFoundError(f"Feature directory not found: {feature_dir}")
+
+        # print(f"Loading features from {feature_dir}")
+        # print(f"Augmentation enabled: {use_augmentation}")
+
+        # Define file paths - direct and simple
+        train_features_path = os.path.join(feature_dir, "train_features.pt")
+        train_labels_path = os.path.join(feature_dir, "train_labels.pt")
+        val_features_path = os.path.join(feature_dir, "val_features.pt")
+        val_labels_path = os.path.join(feature_dir, "val_labels.pt")
+
+        # Check if train files exist
+        if not os.path.exists(train_features_path):
+            raise FileNotFoundError(f"Train features not found at {train_features_path}")
+
+        # Find augmented versions
+        augmentation_paths = []
+        aug_idx = 1
+
+        while True:
+            aug_feat_path = os.path.join(feature_dir, f"train_features_aug{aug_idx}.pt")
+            aug_label_path = os.path.join(feature_dir, f"train_labels_aug{aug_idx}.pt")
+
+            if os.path.exists(aug_feat_path) and os.path.exists(aug_label_path):
+                augmentation_paths.append((aug_feat_path, aug_label_path))
+                aug_idx += 1
+
+                # If max_augmentations is set, limit the number of augmentations
+                if max_augmentations is not None and len(augmentation_paths) >= max_augmentations:
+                    break
+            else:
+                break
+
+        # print(f"Found {len(augmentation_paths)} augmented versions")
+
+        # Create train dataset with augmentation support
+        self.train_dataset = PrecomputedFeatureDataset(
+            train_features_path,
+            train_labels_path,
+            verbose=True,
+            augmentation_paths=augmentation_paths,
+            use_augmentation=use_augmentation
+        )
+
+        # Enable training mode for train dataset
+        self.train_dataset.train(True)
+
+        # Create train loader
+        self.train_loader = torch.utils.data.DataLoader(
+            self.train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            persistent_workers=persistent_workers and num_workers > 0,
+            pin_memory=True,
+            drop_last=False,
+            timeout=120,  # Add timeout to prevent worker hangs
+        )
+
+        # Create test dataset (no augmentation for evaluation)
+        self.test_dataset = PrecomputedFeatureDataset(
+            val_features_path,
+            val_labels_path,
+            verbose=True,
+            augmentation_paths=None,  # No augmentation for test dataset
+            use_augmentation=False
+        )
+
+        # Set test dataset to evaluation mode
+        self.test_dataset.train(False)
+
+        # Create test loader
+        self.test_loader = torch.utils.data.DataLoader(
+            self.test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            persistent_workers=persistent_workers and num_workers > 0,
+            pin_memory=True,
+            drop_last=False,
+            timeout=120,
+        )
+
+        # Load classnames if available
+        classnames_path = os.path.join(feature_dir, "classnames.txt")
+        if os.path.exists(classnames_path):
+            with open(classnames_path, "r") as f:
+                self.classnames = [line.strip() for line in f.readlines()]
+            # print(f"Loaded {len(self.classnames)} class names from {classnames_path}")
+        else:
+            # Create dummy classnames if file doesn't exist
+            unique_labels = torch.unique(self.train_dataset.labels)
+            self.classnames = [f"class_{i}" for i in range(len(unique_labels))]
+            print(f"Created {len(self.classnames)} dummy class names")
 
 
 def cleanup_resources(dataset):
@@ -49,51 +270,33 @@ def cleanup_resources(dataset):
     torch.cuda.empty_cache()
 
 
-def setup_ddp_robust(rank, world_size, port=None, max_retries=5):
-    """Setup distributed training with robust port handling"""
-    # Generate random port if not specified
-    if port is None:
-        port = random.randint(40000, 65000)
+def evaluate_model(model, classifier, dataset, device):
+    """Evaluate model on dataset"""
+    model.eval()
+    classifier.eval()
+    correct = 0
+    total = 0
 
-    for retry in range(max_retries):
-        try:
-            # Use different port for each retry
-            current_port = port + retry
+    with torch.no_grad():
+        for batch in dataset.test_loader:
+            batch = maybe_dictionarize(batch)
+            features = batch["features"].to(device)
+            labels = batch["labels"].to(device)
 
-            os.environ["MASTER_ADDR"] = "localhost"
-            os.environ["MASTER_PORT"] = str(current_port)
+            # Forward pass
+            transformed_features = model(features)
+            outputs = classifier(transformed_features)
 
-            torch.distributed.init_process_group(
-                "nccl",
-                rank=rank,
-                world_size=world_size,
-                timeout=timedelta(minutes=10)
-            )
-            torch.cuda.set_device(rank)
-            torch.distributed.barrier()
+            # Compute accuracy
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
 
-            if rank == 0:
-                print(f"Successfully initialized distributed setup with {world_size} processes")
-            return True
-
-        except Exception as e:
-            print(f"Process {rank}: Failed on port {current_port}: {e}")
-            # Wait before retrying
-            time.sleep(random.uniform(1, 3))
-
-    print(f"Process {rank}: Failed to initialize distributed setup after {max_retries} attempts")
-    return False
+    return correct / total
 
 
 def plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir):
-    """Plot and save training metrics (loss curves) separately
-
-    Args:
-        train_losses: List of task loss values
-        reg_losses: List of regularization loss values
-        dataset_name: Name of the dataset
-        plot_dir: Directory to save plots
-    """
+    """Plot and save training metrics (loss curves)"""
     # Create figure for loss plots
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
 
@@ -118,17 +321,7 @@ def plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir):
 def plot_validation_metrics(val_accuracies, base_threshold_values, beta_values,
                            log_base_threshold_values, log_beta_values,
                            dataset_name, plot_dir):
-    """Plot and save validation metrics and parameter evolution separately
-
-    Args:
-        val_accuracies: List of validation accuracy values
-        base_threshold_values: List of base threshold parameter values
-        beta_values: List of beta parameter values
-        log_base_threshold_values: List of log base threshold parameter values
-        log_beta_values: List of log beta parameter values
-        dataset_name: Name of the dataset
-        plot_dir: Directory to save plots
-    """
+    """Plot and save validation metrics and parameter evolution"""
     # Create figure for accuracy plot
     fig, ax = plt.subplots(figsize=(12, 6))
 
@@ -191,305 +384,93 @@ def plot_validation_metrics(val_accuracies, base_threshold_values, beta_values,
     plt.close()
 
 
-def plot_gradients(grad_magnitudes, dataset_name, plot_dir):
-    """Plot and save gradient magnitudes
-
-    Args:
-        grad_magnitudes: List of dictionaries containing gradient information
-        dataset_name: Name of the dataset
-        plot_dir: Directory to save plots
-    """
-    if not grad_magnitudes:
-        return
-
-    plt.figure(figsize=(12, 6))
-    iterations = range(len(grad_magnitudes))
-
-    # Extract and plot log base threshold gradients
-    log_base_grads = [g.get('log_base', 0) for g in grad_magnitudes]
-    plt.plot(iterations, log_base_grads, 'r-', linewidth=1.5, label='log(αT) Gradient')
-
-    # Extract and plot log beta gradients
-    log_beta_grads = [g.get('log_beta', 0) for g in grad_magnitudes]
-    plt.plot(iterations, log_beta_grads, 'g-', linewidth=1.5, label='log(β) Gradient')
-
-    plt.xlabel('Iterations', fontsize=14)
-    plt.ylabel('Gradient Magnitude', fontsize=14)
-    plt.title(f'Parameter Gradients for {dataset_name}', fontsize=16)
-    plt.legend(fontsize=12)
-    plt.grid(True, alpha=0.7)
-
-    # Set y-axis limits to focus on gradient changes
-    y_min = min(min(log_base_grads), min(log_beta_grads))
-    y_max = max(max(log_base_grads), max(log_beta_grads))
-    y_range = y_max - y_min
-    plt.ylim([y_min - 0.1 * y_range, y_max + 0.1 * y_range])
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(plot_dir, f'{dataset_name}_gradient_magnitudes.png'), dpi=300)
-    plt.close()
-
-
-def get_precomputed_dataset(dataset_name, model_name, location, batch_size=128, num_workers=2,
-                           use_augmentation=True, max_augmentations=None, verbose=False):
-    """Get dataset with pre-computed features with improved path handling
-
-    Args:
-        dataset_name: Name of the dataset
-        model_name: Name of the model used for feature extraction
-        location: Root data directory
-        batch_size: Batch size for dataloaders
-        num_workers: Number of worker threads
-        use_augmentation: Whether to use augmentations during training
-        max_augmentations: Maximum number of augmentations to use (None for all)
-        verbose: Whether to print detailed logs
-
-    Returns:
-        dataset: Dataset with pre-computed features
-    """
-    # Import required modules
-    from src.precomputed_feature_dataset import PrecomputedFeatures
-
-    # Clean dataset name if it has "precomputed_" prefix
-    if dataset_name.startswith("precomputed_"):
-        dataset_name = dataset_name[len("precomputed_"):]
-
-    # Handle the case where dataset ends with "Val"
-    base_name = dataset_name
-    if dataset_name.endswith("Val"):
-        base_name = dataset_name[:-3]
-
-    # Try with common paths - now with more path variations
-    possible_paths = [
-        # With model name
-        os.path.join(location, "precomputed_features", model_name, dataset_name),
-        os.path.join(location, "precomputed_features", model_name, base_name),
-        os.path.join(location, "precomputed_features", model_name, base_name + "Val"),
-        # Without model name
-        os.path.join(location, "precomputed_features", dataset_name),
-        os.path.join(location, "precomputed_features", base_name),
-        os.path.join(location, "precomputed_features", base_name + "Val"),
-        # Other common locations
-        os.path.join(location, dataset_name),
-        os.path.join(location, base_name),
-        os.path.join(location, base_name + "Val"),
-    ]
-
-    # Special case for SUN397
-    if "SUN397" in dataset_name:
-        sun_paths = [
-            os.path.join(location, "precomputed_features", "SUN397"),
-            os.path.join(location, "SUN397"),
-            os.path.join(location, "precomputed_features", model_name, "SUN397"),
-            os.path.join(location, "precomputed_features", "SUN397Val"),
-        ]
-        possible_paths = sun_paths + possible_paths
-
-    # Fix redundant paths
-    for i, path in enumerate(possible_paths):
-        if "MetaNet-Bayes/MetaNet-Bayes" in path:
-            possible_paths[i] = path.replace("MetaNet-Bayes/MetaNet-Bayes", "MetaNet-Bayes")
-
-    # if verbose:
-    #     print(f"Looking for features for {dataset_name} in {len(possible_paths)} locations")
-
-    # Try each possible path
-    # for path in possible_paths:
-    #     if os.path.exists(path):
-    #         if verbose:
-    #             print(f"Found directory at: {path}")
-
-            try:
-                # Create our dataset with support for augmentation
-                return PrecomputedFeatures(
-                    feature_dir=path,
-                    batch_size=batch_size,
-                    num_workers=num_workers,
-                    use_augmentation=use_augmentation,
-                    max_augmentations=max_augmentations
-                )
-            except Exception as e:
-                print(f"Error creating dataset from {path}: {e}")
-                continue
-
-    # If we get here, try a recursive search
-    if verbose:
-        print(f"Standard search failed, performing recursive search for {base_name}...")
-
-    for root, dirs, files in os.walk(location):
-        if base_name.lower() in root.lower() and any(f.endswith('.pt') for f in files):
-            if verbose:
-                print(f"Found potential directory: {root}")
-
-            try:
-                return PrecomputedFeatures(
-                    feature_dir=root,
-                    batch_size=batch_size,
-                    num_workers=num_workers,
-                    use_augmentation=use_augmentation,
-                    max_augmentations=max_augmentations
-                )
-            except Exception as e:
-                if verbose:
-                    print(f"Error creating dataset from {root}: {e}")
-                # Continue searching
-
-    # If we get here, all paths failed
-    raise FileNotFoundError(f"Pre-computed features not found for {dataset_name}")
-
-
-def evaluate_model(model, classifier, dataset, device):
-    """Evaluate model on dataset"""
-    model.eval()
-    classifier.eval()
-    correct = 0
-    total = 0
-
-    with torch.no_grad():
-        for batch in dataset.test_loader:
-            batch = maybe_dictionarize(batch)
-            features = batch["features"].to(device)
-            labels = batch["labels"].to(device)
-
-            # Forward pass
-            transformed_features = model(features)
-            outputs = classifier(transformed_features)
-
-            # Compute accuracy
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-
-    return correct / total
-
-
-def main(rank, args):
+def train_with_adaptive_gating(rank, args):
     """Main training function with adaptive gating"""
     args.rank = rank
 
-    # Initialize distributed setup with robust port handling
-    if not setup_ddp_robust(args.rank, args.world_size, args.port):
-        print(f"Process {rank}: Failed to initialize distributed setup. Exiting.")
-        return
+    # Initialize distributed setup
+    setup_ddp(args.rank, args.world_size, port=args.port)
 
-    # Process all datasets specified or use defaults
-    if hasattr(args, 'datasets') and args.datasets:
-        datasets_to_process = args.datasets
-    else:
-        # datasets_to_process = ["Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SUN397", "SVHN"]
-        datasets_to_process = ["SVHN"]
+    # Set random seed for reproducibility
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
 
-    # Fix path logic to avoid duplicating MetaNet-Bayes
-    if not hasattr(args, 'save') or args.save is None:
-        # Check if we're already in MetaNet-Bayes directory
-        current_dir = os.getcwd()
-        if current_dir.endswith('MetaNet-Bayes'):
-            args.save = os.path.join(current_dir, "checkpoints_adaptive_gating")
-        else:
-            args.save = os.path.join(current_dir, "MetaNet-Bayes", "checkpoints_adaptive_gating")
-        if rank == 0:
-            print(f"Using save directory: {args.save}")
+    # Process specified datasets
+    # datasets_to_process = args.datasets if args.datasets else [
+    #     "Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SUN397", "SVHN"
+    # ]
+    datasets_to_process = args.datasets if args.datasets else ["SVHN"]
 
-    # Create save directory
-    if is_main_process():
-        os.makedirs(args.save, exist_ok=True)
+    # Ensure save directory exists
+    os.makedirs(args.save_dir, exist_ok=True)
 
-    # Fix data location to proper path
-    current_dir = os.getcwd()
-    if hasattr(args, 'data_location') and args.data_location:
-        # Remove redundant MetaNet-Bayes if present
-        if "MetaNet-Bayes/MetaNet-Bayes" in args.data_location:
-            args.data_location = args.data_location.replace("MetaNet-Bayes/MetaNet-Bayes", "MetaNet-Bayes")
-    else:
-        # Set default data location
-        if current_dir.endswith('MetaNet-Bayes'):
-            args.data_location = current_dir
-        else:
-            args.data_location = os.path.join(current_dir, "MetaNet-Bayes")
-
-    # Print configuration only from main process
+    # Print configuration (main process only)
     if rank == 0:
         print(f"\n=== Training Configuration ===")
         print(f"Model: {args.model}")
         print(f"Using blockwise coefficients: {args.blockwise_coef}")
-        if args.no_gating:
-            print(f"Gating disabled (no-gating mode)")
-        else:
-            print(f"Initial αT: {args.base_threshold:.4f}, β: {args.beta:.4f}")
-            print(f"Uncertainty regularization: {args.uncertainty_reg}")
+        print(f"Initial αT: {args.base_threshold:.4f}, β: {args.beta:.4f}")
+        print(f"Uncertainty regularization: {args.uncertainty_reg}")
         print(f"Using augmentation: {args.use_augmentation}")
-        if args.use_augmentation:
-            print(f"Max augmentations: {args.max_augmentations if hasattr(args, 'max_augmentations') else 'All'}")
+        print(f"Max augmentations: {args.max_augmentations}")
         print(f"Batch size: {args.batch_size}")
         print(f"Learning rate: {args.lr}")
         print(f"Epochs: {args.epochs}")
-        print(f"Save directory: {args.save}")
+        print(f"Save directory: {args.save_dir}")
+        print(f"Datasets: {datasets_to_process}")
         print("=" * 30)
 
     for dataset_name in datasets_to_process:
-        target_dataset = f"precomputed_{dataset_name}Val"  # Use precomputed features
         if is_main_process():
             print(f"=== Training on {dataset_name} with adaptive gating ===")
 
         # Setup save directory for this dataset
-        save_dir = os.path.join(args.save, dataset_name + "Val")
+        save_dir = os.path.join(args.save_dir, dataset_name + "Val")
         if is_main_process():
             os.makedirs(save_dir, exist_ok=True)
 
         dataset = None
 
         try:
-            # Apply dataset-specific augmentation settings
-            use_augmentation = args.use_augmentation
-            max_augmentations = args.max_augmentations if hasattr(args, 'max_augmentations') else None
+            # Define feature directory based on standard structure
+            feature_dir = os.path.join(args.data_location, "precomputed_features", args.model, dataset_name + "Val")
 
-            # Special case for SUN397 due to potential corrupted images issues
-            if dataset_name == "SUN397" and hasattr(args, 'sun397_no_augmentation') and args.sun397_no_augmentation:
+            # Verify directory exists before proceeding
+            if not os.path.exists(feature_dir):
                 if is_main_process():
-                    print(f"Disabling augmentation for SUN397 dataset due to sun397_no_augmentation flag")
-                use_augmentation = False
+                    print(f"Error: Feature directory not found at {feature_dir}")
+                continue
 
-            # Get precomputed features with augmentation support
-            dataset = get_precomputed_dataset(
-                dataset_name=target_dataset,
-                model_name=args.model,
-                location=args.data_location,
+            # Load dataset with precomputed features
+            dataset = PrecomputedFeatures(
+                feature_dir=feature_dir,
                 batch_size=args.batch_size,
                 num_workers=2,  # Reduced for stability
-                use_augmentation=use_augmentation,
-                max_augmentations=max_augmentations,
-                verbose=True  # Debug path issues
+                use_augmentation=args.use_augmentation,
+                max_augmentations=args.max_augmentations
             )
 
-            # Sample feature to get dimensions
-            try:
-                sample_batch = next(iter(dataset.train_loader))
-                sample_batch = maybe_dictionarize(sample_batch)
-                feature_dim = sample_batch["features"].shape[1]
-                if is_main_process():
-                    print(f"Feature dimension: {feature_dim}")
-            except Exception as e:
-                if is_main_process():
-                    print(f"Error getting feature dimension: {e}")
-                    traceback.print_exc()
-                raise
+            # Get feature dimension from dataset
+            sample_batch = next(iter(dataset.train_loader))
+            sample_batch = maybe_dictionarize(sample_batch)
+            feature_dim = sample_batch["features"].shape[1]
+            if is_main_process():
+                print(f"Feature dimension: {feature_dim}")
 
-            # Create model
-            try:
-                model = AdaptiveGatingMetaNet(
-                    feature_dim=feature_dim,
-                    task_vectors=args.num_task_vectors if hasattr(args, 'num_task_vectors') else 8,
-                    blockwise=args.blockwise_coef if hasattr(args, 'blockwise_coef') else False,
-                    base_threshold=args.base_threshold,
-                    beta=args.beta,
-                    uncertainty_reg=args.uncertainty_reg
-                )
-                model = model.to(rank)
-            except Exception as e:
-                if is_main_process():
-                    print(f"Error creating model: {e}")
-                    traceback.print_exc()
-                raise
+            # Create adaptive gating model
+            model = AdaptiveGatingMetaNet(
+                feature_dim=feature_dim,
+                task_vectors=args.num_task_vectors,
+                blockwise=args.blockwise_coef,
+                base_threshold=args.base_threshold,
+                beta=args.beta,
+                uncertainty_reg=args.uncertainty_reg
+            )
+            model = model.to(rank)
 
             data_loader = dataset.train_loader
             num_batches = len(data_loader)
@@ -497,102 +478,73 @@ def main(rank, args):
             # Set print frequency
             print_every = max(num_batches // 10, 1)
 
-            # Single GPU training instead of DDP to avoid issues with unused parameters
-            if args.world_size <= 1:
-                # Single GPU training setup
-                print("Using single GPU training")
-                ddp_model = model
-                ddp_loader = data_loader
-            else:
-                # Distributed training setup
-                try:
-                    ddp_loader = distribute_loader(data_loader)
-                    ddp_model = torch.nn.parallel.DistributedDataParallel(
-                        model,
-                        device_ids=[args.rank],
-                        find_unused_parameters=False
-                    )
-                except Exception as e:
-                    if is_main_process():
-                        print(f"Error in distributed setup, falling back to single GPU: {e}")
-                        ddp_model = model
-                        ddp_loader = data_loader
+            # Distributed training setup
+            ddp_loader = distribute_loader(data_loader)
+            ddp_model = torch.nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=[args.rank],
+                find_unused_parameters=False
+            )
 
             # Setup classifier layer
-            try:
-                num_classes = len(dataset.classnames)
-                classifier = torch.nn.Linear(feature_dim, num_classes).cuda()
-            except Exception as e:
-                if is_main_process():
-                    print(f"Error setting up classifier: {e}")
-                    traceback.print_exc()
-                raise
+            num_classes = len(dataset.classnames)
+            classifier = torch.nn.Linear(feature_dim, num_classes).cuda()
 
-            # Setup optimizer with different parameter groups
-            try:
-                # Group parameters to allow different learning rates
-                gating_log_params = []
-                meta_net_params = []
-                other_params = []
+            # Setup optimizer with parameter groups
+            # Group parameters to allow different learning rates
+            gating_log_params = []
+            meta_net_params = []
+            other_params = []
 
-                # Separate parameters by type
-                for name, param in ddp_model.named_parameters():
-                    if 'log_beta' in name:
-                        gating_log_params.append(param)
-                    elif 'log_base_threshold' in name:
-                        gating_log_params.append(param)
-                    elif 'meta_net' in name:
-                        meta_net_params.append(param)
-                    else:
-                        other_params.append(param)
+            # Separate parameters by type
+            for name, param in ddp_model.named_parameters():
+                if 'log_beta' in name or 'log_base_threshold' in name:
+                    gating_log_params.append(param)
+                elif 'meta_net' in name:
+                    meta_net_params.append(param)
+                else:
+                    other_params.append(param)
 
-                # Add classifier parameters
-                other_params.extend(list(classifier.parameters()))
+            # Add classifier parameters
+            other_params.extend(list(classifier.parameters()))
 
-                # Create parameter groups with different learning rates
-                param_groups = [
-                    {'params': gating_log_params, 'lr': args.lr * 100, 'weight_decay': 0.0001},  # Higher LR for gating
-                    {'params': meta_net_params, 'lr': args.lr * 2, 'weight_decay': 0.001},      # Higher LR for meta_net
-                    {'params': other_params, 'lr': args.lr, 'weight_decay': args.wd if hasattr(args, 'wd') else 0.01}
-                ]
+            # Create parameter groups with different learning rates
+            param_groups = [
+                {'params': gating_log_params, 'lr': args.lr * 100, 'weight_decay': 0.0001},  # Higher LR for gating
+                {'params': meta_net_params, 'lr': args.lr * 2, 'weight_decay': 0.001},       # Higher LR for meta_net
+                {'params': other_params, 'lr': args.lr, 'weight_decay': args.wd}
+            ]
 
-                optimizer = torch.optim.AdamW(param_groups)
+            optimizer = torch.optim.AdamW(param_groups)
 
-                # Learning rate scheduler
-                scheduler = cosine_lr(
-                    optimizer,
-                    args.lr if hasattr(args, 'lr') else 1e-3,
-                    0,
-                    args.epochs * num_batches if hasattr(args, 'epochs') else 10 * num_batches
-                )
+            # Learning rate scheduler
+            scheduler = cosine_lr(
+                optimizer,
+                args.lr,
+                0,
+                args.epochs * num_batches
+            )
 
-                # Loss function
-                loss_fn = torch.nn.CrossEntropyLoss()
+            # Loss function
+            loss_fn = torch.nn.CrossEntropyLoss()
 
-                # Mixed precision training
-                scaler = GradScaler()
-            except Exception as e:
-                if is_main_process():
-                    print(f"Error setting up optimizer: {e}")
-                    traceback.print_exc()
-                raise
+            # Mixed precision training
+            scaler = GradScaler()
 
             # Training monitoring
             train_losses = []
             reg_losses = []
             val_accuracies = []
             gating_stats = []
-            base_threshold_values = []  # Track base threshold values
-            beta_values = []  # Track beta values
-            log_base_threshold_values = []  # Track log base threshold values
-            log_beta_values = []  # Track log beta values
-            grad_magnitudes = []  # Track gradient magnitudes
+            base_threshold_values = []
+            beta_values = []
+            log_base_threshold_values = []
+            log_beta_values = []
             best_acc = 0.0
             best_model_state = None
 
             # Training loop
-            num_epochs = args.epochs if hasattr(args, 'epochs') else 10
-            for epoch in range(num_epochs):
+            for epoch in range(args.epochs):
                 ddp_model.train()
                 classifier.train()
 
@@ -601,7 +553,7 @@ def main(rank, args):
                 batch_count = 0
 
                 if is_main_process():
-                    print(f"\nEpoch {epoch+1}/{num_epochs} - Training")
+                    print(f"\nEpoch {epoch+1}/{args.epochs} - Training")
 
                 for i, batch in enumerate(ddp_loader):
                     start_time = time.time()
@@ -614,7 +566,7 @@ def main(rank, args):
                         # Track augmentation usage if available
                         if i % print_every == 0 and is_main_process() and "augmented" in batch:
                             aug_count = sum(1 for item in batch["augmented"] if item)
-                            print(f"Batch {i}: Using {aug_count}/{len(batch['augmented'])} augmented samples")
+                            # print(f"Batch {i}: Using {aug_count}/{len(batch['augmented'])} augmented samples")
 
                         with torch.autocast(device_type='cuda', dtype=torch.float16):
                             # Forward pass
@@ -624,38 +576,13 @@ def main(rank, args):
                             # Task loss
                             task_loss = loss_fn(logits, labels)
 
-                            # Add uncertainty regularization - only if gating is enabled
-                            if not args.no_gating:
-                                if isinstance(ddp_model, torch.nn.parallel.DistributedDataParallel):
-                                    reg_loss = ddp_model.module.uncertainty_regularization_loss()
-                                else:
-                                    reg_loss = ddp_model.uncertainty_regularization_loss()
-                            else:
-                                # When no_gating is True, set reg_loss to 0
-                                reg_loss = torch.tensor(0.0, device=features.device)
+                            # Add uncertainty regularization
+                            reg_loss = ddp_model.module.uncertainty_regularization_loss()
 
                             total_loss = task_loss + reg_loss
 
                         # Backward pass
                         scaler.scale(total_loss).backward()
-
-                        # Check log parameters' gradients (only for periodic logging)
-                        if is_main_process() and i % print_every == 0:
-                            # Get original model reference
-                            if isinstance(ddp_model, torch.nn.parallel.DistributedDataParallel):
-                                model_ref = ddp_model.module
-                            else:
-                                model_ref = ddp_model
-
-                            # Get gradients
-                            log_base_grad = model_ref.log_base_threshold.grad
-                            log_beta_grad = model_ref.log_beta.grad
-
-                            # Save gradient information for later plotting
-                            grad_magnitudes.append({
-                                'log_base': log_base_grad.item() if log_base_grad is not None else 0.0,
-                                'log_beta': log_beta_grad.item() if log_beta_grad is not None else 0.0
-                            })
 
                         # Step optimizer
                         scheduler(i + epoch * num_batches)
@@ -676,39 +603,28 @@ def main(rank, args):
 
                         # Print progress (only with reduced frequency)
                         if i % print_every == 0 and is_main_process():
-                            # Get original model reference
-                            if isinstance(ddp_model, torch.nn.parallel.DistributedDataParallel):
-                                model_ref = ddp_model.module
-                            else:
-                                model_ref = ddp_model
-
                             # Get current gating parameters
-                            current_base_threshold = float(model_ref.base_threshold.item())
-                            current_beta = float(model_ref.beta.item())
+                            current_base_threshold = float(ddp_model.module.base_threshold.item())
+                            current_beta = float(ddp_model.module.beta.item())
 
                             # Get gating statistics if available
                             gating_ratio = 0.0
-                            if hasattr(model_ref, 'get_gating_stats'):
-                                stats = model_ref.get_gating_stats()
+                            if hasattr(ddp_model.module, 'get_gating_stats'):
+                                stats = ddp_model.module.get_gating_stats()
                                 if stats:
                                     gating_stats.append(stats)
                                     gating_ratio = stats.get('gating_ratio', 0.0)
 
                             # Compact progress output with shortened elapsed time
                             t_elapsed = time.time() - start_time
-
-                            # Adjust output based on gating mode
-                            if args.no_gating:
-                                print(f"  Batch {i:4d}/{num_batches:4d} | Loss: {task_loss_cpu:.4f} | "
-                                      f"t: {t_elapsed:.2f}s (Gating Disabled)")
-                            else:
-                                print(f"  Batch {i:4d}/{num_batches:4d} | Loss: {task_loss_cpu:.4f} | "
-                                      f"Reg: {reg_loss_cpu:.4f} | αT: {current_base_threshold:.4f} | "
-                                      f"β: {current_beta:.4f} | Gate: {gating_ratio:.3f} | t: {t_elapsed:.2f}s")
+                            print(f"  Batch {i:4d}/{num_batches:4d} | Loss: {task_loss_cpu:.4f} | "
+                                  f"Reg: {reg_loss_cpu:.4f} | αT: {current_base_threshold:.4f} | "
+                                  f"β: {current_beta:.4f} | Gate: {gating_ratio:.3f} | t: {t_elapsed:.2f}s")
 
                     except Exception as e:
                         if is_main_process():
                             print(f"  Error in batch {i}: {e}")
+                            traceback.print_exc()
                         # Skip this batch but continue training
                         continue
 
@@ -718,17 +634,11 @@ def main(rank, args):
 
                 # Record parameter values at the end of each epoch
                 if is_main_process():
-                    # Get original model reference
-                    if isinstance(ddp_model, torch.nn.parallel.DistributedDataParallel):
-                        model_ref = ddp_model.module
-                    else:
-                        model_ref = ddp_model
-
                     # Get current parameters
-                    current_base_threshold = float(model_ref.base_threshold.item())
-                    current_beta = float(model_ref.beta.item())
-                    current_log_base_threshold = float(model_ref.log_base_threshold.item())
-                    current_log_beta = float(model_ref.log_beta.item())
+                    current_base_threshold = float(ddp_model.module.base_threshold.item())
+                    current_beta = float(ddp_model.module.beta.item())
+                    current_log_base_threshold = float(ddp_model.module.log_base_threshold.item())
+                    current_log_beta = float(ddp_model.module.log_beta.item())
 
                     # Save to lists
                     base_threshold_values.append(current_base_threshold)
@@ -736,25 +646,16 @@ def main(rank, args):
                     log_base_threshold_values.append(current_log_base_threshold)
                     log_beta_values.append(current_log_beta)
 
-                    # Epoch summary - adjust based on gating mode
-                    if args.no_gating:
-                        print(f"  Summary: Task Loss: {avg_epoch_loss:.4f} (Gating Disabled)")
-                    else:
-                        print(f"  Summary: Task Loss: {avg_epoch_loss:.4f} | Reg Loss: {avg_epoch_reg_loss:.4f} | "
-                              f"αT: {current_base_threshold:.4f} | β: {current_beta:.4f}")
+                    # Epoch summary
+                    print(f"  Summary: Task Loss: {avg_epoch_loss:.4f} | Reg Loss: {avg_epoch_reg_loss:.4f} | "
+                          f"αT: {current_base_threshold:.4f} | β: {current_beta:.4f}")
 
                 # Evaluate on validation set
                 if is_main_process():
-                    print(f"Epoch {epoch+1}/{num_epochs} - Validation")
-
-                    # Get model for evaluation
-                    if isinstance(ddp_model, torch.nn.parallel.DistributedDataParallel):
-                        eval_model = ddp_model.module
-                    else:
-                        eval_model = ddp_model
+                    print(f"Epoch {epoch+1}/{args.epochs} - Validation")
 
                     val_acc = evaluate_model(
-                        model=eval_model,
+                        model=ddp_model.module,
                         classifier=classifier,
                         dataset=dataset,
                         device=rank
@@ -770,45 +671,32 @@ def main(rank, args):
                         # Store model configuration along with weights
                         config = {
                             'feature_dim': feature_dim,
-                            'num_task_vectors': args.num_task_vectors if hasattr(args, 'num_task_vectors') else 8,
-                            'blockwise': args.blockwise_coef if hasattr(args, 'blockwise_coef') else False,
+                            'num_task_vectors': args.num_task_vectors,
+                            'blockwise': args.blockwise_coef,
                             'base_threshold': current_base_threshold,
                             'beta': current_beta,
                             'log_base_threshold': current_log_base_threshold,
                             'log_beta': current_log_beta,
                             'uncertainty_reg': args.uncertainty_reg,
                             'model_name': args.model,
-                            'use_augmentation': args.use_augmentation,
-                            'no_gating': args.no_gating
+                            'use_augmentation': args.use_augmentation
                         }
 
-                        # Get appropriate state dict
-                        if isinstance(ddp_model, torch.nn.parallel.DistributedDataParallel):
-                            model_state_dict = ddp_model.module.state_dict()
-                        else:
-                            model_state_dict = ddp_model.state_dict()
-
                         best_model_state = {
-                            'meta_net': model_state_dict,
+                            'meta_net': ddp_model.module.state_dict(),
                             'classifier': classifier.state_dict(),
                             'epoch': epoch,
                             'acc': val_acc,
                             'config': config
                         }
 
-                        # Adjust message based on gating mode
-                        if args.no_gating:
-                            print(f"  New best model! (Gating Disabled)")
-                        else:
-                            print(f"  New best model! αT: {current_base_threshold:.4f}, β: {current_beta:.4f}")
+                        print(f"  New best model! αT: {current_base_threshold:.4f}, β: {current_beta:.4f}")
 
             # Save results
             if is_main_process():
-                # Save best model - append suffix if gating is disabled
-                model_suffix = "_no_gating" if args.no_gating else ""
-
+                # Save best model
                 if best_model_state:
-                    best_model_path = os.path.join(save_dir, f"best_adaptive_gating_model{model_suffix}.pt")
+                    best_model_path = os.path.join(save_dir, "best_adaptive_gating_model.pt")
                     print(f"Saving best model to {best_model_path}")
                     torch.save(best_model_state, best_model_path)
 
@@ -822,46 +710,34 @@ def main(rank, args):
                     'beta_values': beta_values,
                     'log_base_threshold_values': log_base_threshold_values,
                     'log_beta_values': log_beta_values,
-                    'grad_magnitudes': grad_magnitudes,
                     'best_acc': best_acc,
                     'config': config if 'config' in locals() else {},
-                    'use_augmentation': args.use_augmentation,
-                    'no_gating': args.no_gating
+                    'use_augmentation': args.use_augmentation
                 }
 
-                history_filename = f"adaptive_gating_training_history{model_suffix}.json"
-                with open(os.path.join(save_dir, history_filename), 'w') as f:
+                with open(os.path.join(save_dir, "adaptive_gating_training_history.json"), 'w') as f:
                     # Convert numpy values to Python types
                     for key in history:
-                        if isinstance(history[key], (list, dict)) and key not in ['gating_stats', 'grad_magnitudes']:
+                        if isinstance(history[key], (list, dict)) and key not in ['gating_stats']:
                             history[key] = [float(item) if isinstance(item, (np.floating, np.integer)) else item
                                           for item in history[key]]
 
                     json.dump(history, f, indent=4)
 
                 # Create plots directory
-                plot_dir = os.path.join(args.save, "adaptive_gating_plots")
+                plot_dir = os.path.join(args.save_dir, "adaptive_gating_plots")
                 os.makedirs(plot_dir, exist_ok=True)
 
-                # Create separate plots for loss curves
+                # Create plots for loss curves and validation metrics
                 plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir)
-
-                # Create separate plots for validation accuracy and parameter evolution
                 plot_validation_metrics(
                     val_accuracies, base_threshold_values, beta_values,
                     log_base_threshold_values, log_beta_values,
                     dataset_name, plot_dir
                 )
 
-                # Create plot for gradient magnitudes
-                plot_gradients(grad_magnitudes, dataset_name, plot_dir)
-
-                # Print final message with gating mode info
-                if args.no_gating:
-                    print(f"Training completed for {dataset_name} (Gating Disabled). Best validation accuracy: {best_acc*100:.2f}%")
-                else:
-                    print(f"Training completed for {dataset_name}. Best validation accuracy: {best_acc*100:.2f}%")
-                    print(f"Final parameters - αT: {base_threshold_values[-1]:.4f}, β: {beta_values[-1]:.4f}")
+                print(f"Training completed for {dataset_name}. Best validation accuracy: {best_acc*100:.2f}%")
+                print(f"Final parameters - αT: {base_threshold_values[-1]:.4f}, β: {beta_values[-1]:.4f}")
 
         except Exception as e:
             if is_main_process():
@@ -877,72 +753,8 @@ def main(rank, args):
 
 
 if __name__ == "__main__":
-    # Parse arguments
-    from src.args import parse_arguments
-    args = parse_arguments()
-
-    # Set random seed for reproducibility
-    if args.seed is not None:
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(args.seed)
-
-    # Handle --no-gating parameter
-    if args.no_gating:
-        args.base_threshold = NO_GATING_THRESHOLD
-        args.beta = NO_GATING_THRESHOLD
-        args.uncertainty_reg = 0.0
-        print(f"No-gating mode enabled: setting base_threshold={args.base_threshold}, "
-              f"beta={args.beta}, uncertainty_reg={args.uncertainty_reg}")
-    else:
-        # Set default values for adaptive gating parameters
-        if not hasattr(args, 'base_threshold') or args.base_threshold is None:
-            args.base_threshold = 0.05
-        if not hasattr(args, 'beta') or args.beta is None:
-            args.beta = 1.0
-        if not hasattr(args, 'uncertainty_reg') or args.uncertainty_reg is None:
-            args.uncertainty_reg = 0.01
-
-    # Handle other parameters with defaults
-    if not hasattr(args, 'num_task_vectors'):
-        args.num_task_vectors = 8
-
-    # Augmentation settings
-    if not hasattr(args, 'use_augmentation'):
-        args.use_augmentation = True  # Default to using augmentation
-    if not hasattr(args, 'max_augmentations'):
-        args.max_augmentations = None  # Use all available augmentations
-
-    # Special case for SUN397
-    args.sun397_no_augmentation = False
-
-    # Set default training parameters if not specified
-    if not hasattr(args, 'lr') or not args.lr:
-        args.lr = 5e-3
-    if not hasattr(args, 'epochs') or not args.epochs:
-        args.epochs = 20
-    if not hasattr(args, 'batch_size') or not args.batch_size:
-        args.batch_size = 128
-    if not hasattr(args, 'wd') or not args.wd:
-        args.wd = 0.01
-
-    # Set random port if not specified to avoid conflicts
-    if not hasattr(args, 'port') or not args.port:
-        args.port = random.randint(40000, 65000)
-
-    # Launch training with better error handling
     try:
-        torch.multiprocessing.spawn(main, args=(args,), nprocs=args.world_size)
+        torch.multiprocessing.spawn(train_with_adaptive_gating, args=(args,), nprocs=args.world_size)
     except Exception as e:
         print(f"Training failed with error: {e}")
         traceback.print_exc()
-        # Force cleanup in case of failure
-        for i in range(torch.cuda.device_count()):
-            if i < args.world_size:
-                try:
-                    torch.cuda.set_device(i)
-                    torch.cuda.empty_cache()
-                except:
-                    pass
