@@ -17,6 +17,9 @@ import sys
 import traceback
 from datetime import datetime, timedelta
 
+# 定义关闭门控使用的极小阈值
+NO_GATING_THRESHOLD = 1e-6
+
 from src.adaptive_gating_metanet import AdaptiveGatingMetaNet
 from src.utils import cosine_lr
 from src.datasets.common import maybe_dictionarize
@@ -287,14 +290,14 @@ def get_precomputed_dataset(dataset_name, model_name, location, batch_size=128, 
         if "MetaNet-Bayes/MetaNet-Bayes" in path:
             possible_paths[i] = path.replace("MetaNet-Bayes/MetaNet-Bayes", "MetaNet-Bayes")
 
-    if verbose:
-        print(f"Looking for features for {dataset_name} in {len(possible_paths)} locations")
+    # if verbose:
+    #     print(f"Looking for features for {dataset_name} in {len(possible_paths)} locations")
 
     # Try each possible path
-    for path in possible_paths:
-        if os.path.exists(path):
-            if verbose:
-                print(f"Found directory at: {path}")
+    # for path in possible_paths:
+    #     if os.path.exists(path):
+    #         if verbose:
+    #             print(f"Found directory at: {path}")
 
             try:
                 # Create our dataset with support for augmentation
@@ -373,11 +376,8 @@ def main(rank, args):
     if hasattr(args, 'datasets') and args.datasets:
         datasets_to_process = args.datasets
     else:
-        # Cars lr=0.01 *50
-        # DTD,EuroSAT  lr=0.0005 *50
-        # sun397 lr=0.0005 72.49
         # datasets_to_process = ["Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SUN397", "SVHN"]
-        datasets_to_process = ["SUN397"]
+        datasets_to_process = ["SVHN"]
 
     # Fix path logic to avoid duplicating MetaNet-Bayes
     if not hasattr(args, 'save') or args.save is None:
@@ -412,8 +412,11 @@ def main(rank, args):
         print(f"\n=== Training Configuration ===")
         print(f"Model: {args.model}")
         print(f"Using blockwise coefficients: {args.blockwise_coef}")
-        print(f"Initial αT: {args.base_threshold:.4f}, β: {args.beta:.4f}")
-        print(f"Uncertainty regularization: {args.uncertainty_reg}")
+        if args.no_gating:
+            print(f"Gating disabled (no-gating mode)")
+        else:
+            print(f"Initial αT: {args.base_threshold:.4f}, β: {args.beta:.4f}")
+            print(f"Uncertainty regularization: {args.uncertainty_reg}")
         print(f"Using augmentation: {args.use_augmentation}")
         if args.use_augmentation:
             print(f"Max augmentations: {args.max_augmentations if hasattr(args, 'max_augmentations') else 'All'}")
@@ -621,11 +624,15 @@ def main(rank, args):
                             # Task loss
                             task_loss = loss_fn(logits, labels)
 
-                            # Add uncertainty regularization
-                            if isinstance(ddp_model, torch.nn.parallel.DistributedDataParallel):
-                                reg_loss = ddp_model.module.uncertainty_regularization_loss()
+                            # Add uncertainty regularization - only if gating is enabled
+                            if not args.no_gating:
+                                if isinstance(ddp_model, torch.nn.parallel.DistributedDataParallel):
+                                    reg_loss = ddp_model.module.uncertainty_regularization_loss()
+                                else:
+                                    reg_loss = ddp_model.uncertainty_regularization_loss()
                             else:
-                                reg_loss = ddp_model.uncertainty_regularization_loss()
+                                # When no_gating is True, set reg_loss to 0
+                                reg_loss = torch.tensor(0.0, device=features.device)
 
                             total_loss = task_loss + reg_loss
 
@@ -689,9 +696,15 @@ def main(rank, args):
 
                             # Compact progress output with shortened elapsed time
                             t_elapsed = time.time() - start_time
-                            print(f"  Batch {i:4d}/{num_batches:4d} | Loss: {task_loss_cpu:.4f} | "
-                                  f"Reg: {reg_loss_cpu:.4f} | αT: {current_base_threshold:.4f} | "
-                                  f"β: {current_beta:.4f} | Gate: {gating_ratio:.3f} | t: {t_elapsed:.2f}s")
+
+                            # Adjust output based on gating mode
+                            if args.no_gating:
+                                print(f"  Batch {i:4d}/{num_batches:4d} | Loss: {task_loss_cpu:.4f} | "
+                                      f"t: {t_elapsed:.2f}s (Gating Disabled)")
+                            else:
+                                print(f"  Batch {i:4d}/{num_batches:4d} | Loss: {task_loss_cpu:.4f} | "
+                                      f"Reg: {reg_loss_cpu:.4f} | αT: {current_base_threshold:.4f} | "
+                                      f"β: {current_beta:.4f} | Gate: {gating_ratio:.3f} | t: {t_elapsed:.2f}s")
 
                     except Exception as e:
                         if is_main_process():
@@ -723,9 +736,12 @@ def main(rank, args):
                     log_base_threshold_values.append(current_log_base_threshold)
                     log_beta_values.append(current_log_beta)
 
-                    # Epoch summary
-                    print(f"  Summary: Task Loss: {avg_epoch_loss:.4f} | Reg Loss: {avg_epoch_reg_loss:.4f} | "
-                          f"αT: {current_base_threshold:.4f} | β: {current_beta:.4f}")
+                    # Epoch summary - adjust based on gating mode
+                    if args.no_gating:
+                        print(f"  Summary: Task Loss: {avg_epoch_loss:.4f} (Gating Disabled)")
+                    else:
+                        print(f"  Summary: Task Loss: {avg_epoch_loss:.4f} | Reg Loss: {avg_epoch_reg_loss:.4f} | "
+                              f"αT: {current_base_threshold:.4f} | β: {current_beta:.4f}")
 
                 # Evaluate on validation set
                 if is_main_process():
@@ -762,7 +778,8 @@ def main(rank, args):
                             'log_beta': current_log_beta,
                             'uncertainty_reg': args.uncertainty_reg,
                             'model_name': args.model,
-                            'use_augmentation': args.use_augmentation
+                            'use_augmentation': args.use_augmentation,
+                            'no_gating': args.no_gating
                         }
 
                         # Get appropriate state dict
@@ -779,13 +796,19 @@ def main(rank, args):
                             'config': config
                         }
 
-                        print(f"  New best model! αT: {current_base_threshold:.4f}, β: {current_beta:.4f}")
+                        # Adjust message based on gating mode
+                        if args.no_gating:
+                            print(f"  New best model! (Gating Disabled)")
+                        else:
+                            print(f"  New best model! αT: {current_base_threshold:.4f}, β: {current_beta:.4f}")
 
             # Save results
             if is_main_process():
-                # Save best model
+                # Save best model - append suffix if gating is disabled
+                model_suffix = "_no_gating" if args.no_gating else ""
+
                 if best_model_state:
-                    best_model_path = os.path.join(save_dir, "best_adaptive_gating_model.pt")
+                    best_model_path = os.path.join(save_dir, f"best_adaptive_gating_model{model_suffix}.pt")
                     print(f"Saving best model to {best_model_path}")
                     torch.save(best_model_state, best_model_path)
 
@@ -802,10 +825,12 @@ def main(rank, args):
                     'grad_magnitudes': grad_magnitudes,
                     'best_acc': best_acc,
                     'config': config if 'config' in locals() else {},
-                    'use_augmentation': args.use_augmentation
+                    'use_augmentation': args.use_augmentation,
+                    'no_gating': args.no_gating
                 }
 
-                with open(os.path.join(save_dir, "adaptive_gating_training_history.json"), 'w') as f:
+                history_filename = f"adaptive_gating_training_history{model_suffix}.json"
+                with open(os.path.join(save_dir, history_filename), 'w') as f:
                     # Convert numpy values to Python types
                     for key in history:
                         if isinstance(history[key], (list, dict)) and key not in ['gating_stats', 'grad_magnitudes']:
@@ -831,8 +856,12 @@ def main(rank, args):
                 # Create plot for gradient magnitudes
                 plot_gradients(grad_magnitudes, dataset_name, plot_dir)
 
-                print(f"Training completed for {dataset_name}. Best validation accuracy: {best_acc*50:.2f}%")
-                print(f"Final parameters - αT: {base_threshold_values[-1]:.4f}, β: {beta_values[-1]:.4f}")
+                # Print final message with gating mode info
+                if args.no_gating:
+                    print(f"Training completed for {dataset_name} (Gating Disabled). Best validation accuracy: {best_acc*100:.2f}%")
+                else:
+                    print(f"Training completed for {dataset_name}. Best validation accuracy: {best_acc*100:.2f}%")
+                    print(f"Final parameters - αT: {base_threshold_values[-1]:.4f}, β: {beta_values[-1]:.4f}")
 
         except Exception as e:
             if is_main_process():
@@ -860,13 +889,23 @@ if __name__ == "__main__":
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
 
-    # Set default values for adaptive gating parameters
-    if not hasattr(args, 'base_threshold') or args.base_threshold is None:
-        args.base_threshold = 0.05
-    if not hasattr(args, 'beta') or args.beta is None:
-        args.beta = 1.0
-    if not hasattr(args, 'uncertainty_reg') or args.uncertainty_reg is None:
-        args.uncertainty_reg = 0.01
+    # Handle --no-gating parameter
+    if args.no_gating:
+        args.base_threshold = NO_GATING_THRESHOLD
+        args.beta = NO_GATING_THRESHOLD
+        args.uncertainty_reg = 0.0
+        print(f"No-gating mode enabled: setting base_threshold={args.base_threshold}, "
+              f"beta={args.beta}, uncertainty_reg={args.uncertainty_reg}")
+    else:
+        # Set default values for adaptive gating parameters
+        if not hasattr(args, 'base_threshold') or args.base_threshold is None:
+            args.base_threshold = 0.05
+        if not hasattr(args, 'beta') or args.beta is None:
+            args.beta = 1.0
+        if not hasattr(args, 'uncertainty_reg') or args.uncertainty_reg is None:
+            args.uncertainty_reg = 0.01
+
+    # Handle other parameters with defaults
     if not hasattr(args, 'num_task_vectors'):
         args.num_task_vectors = 8
 

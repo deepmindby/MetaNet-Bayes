@@ -47,20 +47,12 @@ class PrecomputedFeatureDataset(Dataset):
         # Load base features and labels
         try:
             self.features = torch.load(features_path)
-            if verbose:
-                print(f"Successfully loaded features from {features_path}, shape: {self.features.shape}")
         except Exception as e:
-            print(f"Error loading features from {features_path}: {e}")
-            traceback.print_exc()
             raise RuntimeError(f"Failed to load features from {features_path}: {e}")
 
         try:
             self.labels = torch.load(labels_path)
-            if verbose:
-                print(f"Successfully loaded labels from {labels_path}, shape: {self.labels.shape}")
         except Exception as e:
-            print(f"Error loading labels from {labels_path}: {e}")
-            traceback.print_exc()
             raise RuntimeError(f"Failed to load labels from {labels_path}: {e}")
 
         # Validate that features and labels have matching sizes
@@ -82,17 +74,9 @@ class PrecomputedFeatureDataset(Dataset):
                         if aug_features.shape == self.features.shape and aug_labels.shape == self.labels.shape:
                             self.augmented_features.append(aug_features)
                             self.augmented_labels.append(aug_labels)
-                            if verbose:
-                                print(f"Loaded augmented version {aug_idx + 1} from {aug_feat_path}")
-                        else:
-                            print(f"Warning: Augmented version {aug_idx + 1} has mismatched shape, skipping")
-                    except Exception as e:
-                        print(f"Error loading augmented version {aug_idx + 1}: {e}")
-                        if verbose:
-                            traceback.print_exc()
-
-            if verbose:
-                print(f"Loaded {len(self.augmented_features)} augmented versions")
+                    except Exception:
+                        # Continue silently on error
+                        pass
 
     def __len__(self):
         return len(self.features)
@@ -152,9 +136,6 @@ class PrecomputedFeatures:
         if not os.path.exists(feature_dir):
             raise FileNotFoundError(f"Feature directory not found: {feature_dir}")
 
-        print(f"Loading features from {feature_dir}")
-        print(f"Augmentation enabled: {use_augmentation}")
-
         # Define file paths
         train_features_path = os.path.join(feature_dir, "train_features.pt")
         train_labels_path = os.path.join(feature_dir, "train_labels.pt")
@@ -165,10 +146,12 @@ class PrecomputedFeatures:
         if not os.path.exists(train_features_path):
             raise FileNotFoundError(f"Train features not found at {train_features_path}")
 
-        # Find augmented versions
+        # Find augmented versions without verbose output
         augmentation_paths = []
         aug_idx = 1
+        aug_count = 0
 
+        # Count available augmentation files without printing
         while True:
             aug_feat_path = os.path.join(feature_dir, f"train_features_aug{aug_idx}.pt")
             aug_label_path = os.path.join(feature_dir, f"train_labels_aug{aug_idx}.pt")
@@ -176,26 +159,23 @@ class PrecomputedFeatures:
             if os.path.exists(aug_feat_path) and os.path.exists(aug_label_path):
                 augmentation_paths.append((aug_feat_path, aug_label_path))
                 aug_idx += 1
+                aug_count += 1
 
                 # If max_augmentations is set, limit the number of augmentations
-                if max_augmentations is not None and len(augmentation_paths) >= max_augmentations:
+                if max_augmentations is not None and aug_count >= max_augmentations:
                     break
             else:
                 break
-
-        print(f"Found {len(augmentation_paths)} augmented versions")
 
         # Use val features if available, otherwise fall back to train features for testing
         test_features_path = val_features_path if os.path.exists(val_features_path) else train_features_path
         test_labels_path = val_labels_path if os.path.exists(val_labels_path) else train_labels_path
 
-        print(f"Using test features from: {test_features_path}")
-
         # Create datasets
         self.train_dataset = PrecomputedFeatureDataset(
             train_features_path,
             train_labels_path,
-            verbose=True,
+            verbose=False,
             augmentation_paths=augmentation_paths,
             use_augmentation=use_augmentation
         )
@@ -219,7 +199,7 @@ class PrecomputedFeatures:
         self.test_dataset = PrecomputedFeatureDataset(
             test_features_path,
             test_labels_path,
-            verbose=True,
+            verbose=False,
             augmentation_paths=None,  # No augmentation for test dataset
             use_augmentation=False
         )
@@ -244,9 +224,7 @@ class PrecomputedFeatures:
         if os.path.exists(classnames_path):
             with open(classnames_path, "r") as f:
                 self.classnames = [line.strip() for line in f.readlines()]
-            print(f"Loaded {len(self.classnames)} class names from {classnames_path}")
         else:
             # Create dummy classnames if file doesn't exist
             unique_labels = torch.unique(self.train_dataset.labels)
             self.classnames = [f"class_{i}" for i in range(len(unique_labels))]
-            print(f"Created {len(self.classnames)} dummy class names")

@@ -197,35 +197,16 @@ def parse_arguments():
         help="Number of evaluation points used to find optimal coefficient in task arithmetic.",
     )
     parser.add_argument(
-        "--partition",
-        type=int,
-        default=None,
-        help="Run atlas x K where the task vectors are randomly partitioned n times (few-shot only)",
-    )
-    parser.add_argument(
-        "--causal_intervention",
+        "--no-metanet",
         action="store_true",
         default=False,
-        help="Whether to enable causal intervention during training"
+        help="If set, use original ATLAS method with fixed coefficients instead of MetaNet"
     )
     parser.add_argument(
-        "--var_penalty_coef",
-        type=float,
-        default=0.01,
-        help="Coefficient for variance penalty in causal intervention (alpha)"
-    )
-    parser.add_argument(
-        "--intervention_mode",
-        type=str,
-        default="zero",
-        choices=["zero", "perturb"],
-        help="Mode for intervention: zero out coefficients or perturb them"
-    )
-    parser.add_argument(
-        "--top_k_ratio",
-        type=float,
-        default=0.05,  # 0.05
-        help="Ratio of parameter blocks to select for intervention (default: 10%)"
+        "--no-gating",
+        action="store_true",
+        default=False,
+        help="If set, disable gating mechanism when using original ATLAS"
     )
 
     parsed_args = parser.parse_args()
