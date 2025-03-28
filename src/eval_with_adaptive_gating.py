@@ -2,6 +2,7 @@
 
 This script evaluates Adaptive Gating MetaNet models using pre-computed features,
 with enhanced support for augmented data and detailed performance reporting.
+Also supports evaluation of models trained without gating mechanism.
 """
 
 import os
@@ -139,12 +140,13 @@ def cleanup_resources(dataset):
     torch.cuda.empty_cache()
 
 
-def find_model_path(model_dir, dataset_name, debug=False):
-    """Find the model path for a given dataset with simplified logic
+def find_model_path(model_dir, dataset_name, no_gating=False, debug=False):
+    """Find the model path for a given dataset, supporting no-gating models
 
     Args:
         model_dir: Directory containing trained models
         dataset_name: Name of the dataset
+        no_gating: Whether to look for a model trained without gating
         debug: Whether to print debug information
 
     Returns:
@@ -157,12 +159,15 @@ def find_model_path(model_dir, dataset_name, debug=False):
 
     val_name = f"{base_name}Val"
 
+    # Add suffix for no-gating models
+    gating_suffix = "_no_gating" if no_gating else ""
+
     # Check these paths in order
     possible_paths = [
-        os.path.join(model_dir, val_name, "best_adaptive_gating_model.pt"),
-        os.path.join(model_dir, val_name, "best_model.pt"),
-        os.path.join(model_dir, base_name, "best_adaptive_gating_model.pt"),
-        os.path.join(model_dir, base_name, "best_model.pt"),
+        os.path.join(model_dir, val_name, f"best_adaptive_gating{gating_suffix}_model.pt"),
+        os.path.join(model_dir, val_name, f"best_model{gating_suffix}.pt"),
+        os.path.join(model_dir, base_name, f"best_adaptive_gating{gating_suffix}_model.pt"),
+        os.path.join(model_dir, base_name, f"best_model{gating_suffix}.pt"),
     ]
 
     for path in possible_paths:
@@ -171,28 +176,42 @@ def find_model_path(model_dir, dataset_name, debug=False):
                 print(f"Found model at: {path}")
             return path
 
+    # If we reach here but no-gating is True, try looking for models without the suffix
+    # (for backward compatibility)
+    if no_gating:
+        if debug:
+            print("No specific no-gating model found, looking for standard models...")
+        return find_model_path(model_dir, dataset_name, no_gating=False, debug=debug)
+
     # If we reach here, try to find any .pt file in dataset directories
     for root, _, files in os.walk(os.path.join(model_dir, val_name)):
         for file in files:
             if file.endswith(".pt"):
-                path = os.path.join(root, file)
-                if debug:
-                    print(f"Found model at: {path}")
-                return path
+                if (no_gating and "_no_gating" in file) or (not no_gating and "_no_gating" not in file):
+                    path = os.path.join(root, file)
+                    if debug:
+                        print(f"Found model at: {path}")
+                    return path
 
     for root, _, files in os.walk(os.path.join(model_dir, base_name)):
         for file in files:
             if file.endswith(".pt"):
-                path = os.path.join(root, file)
-                if debug:
-                    print(f"Found model at: {path}")
-                return path
+                if (no_gating and "_no_gating" in file) or (not no_gating and "_no_gating" not in file):
+                    path = os.path.join(root, file)
+                    if debug:
+                        print(f"Found model at: {path}")
+                    return path
 
-    raise FileNotFoundError(f"Could not find model for {dataset_name} in {model_dir}")
+    raise FileNotFoundError(f"Could not find {'no-gating' if no_gating else 'gating'} model for {dataset_name} in {model_dir}")
 
 
 def compute_gating_ratio(model, features, device):
     """Compute actual gating ratio for diagnostic purposes"""
+    # For no-gating models, return 0 or 1 based on parameters
+    if hasattr(model, 'base_threshold') and model.base_threshold.item() < 1e-6:
+        # This is likely a no-gating model with very small threshold
+        return 1.0  # All coefficients pass the threshold
+
     # Ensure model is in evaluation mode
     model.eval()
 
@@ -256,10 +275,16 @@ def evaluate_model(model_path, dataset, device, args):
         beta = config.get('beta', args.beta)
         uncertainty_reg = config.get('uncertainty_reg', args.uncertainty_reg)
         use_augmentation = config.get('use_augmentation', True)
+        no_gating = config.get('no_gating', args.no_gating)
 
-        # Print configuration for model identification
-        print(f"Model parameters: αT={base_threshold:.4f}, β={beta:.4f}")
-        print(f"Using {'blockwise' if blockwise else 'global'} coefficients with {num_task_vectors} task vectors")
+        # Check if the model was trained with no-gating mode
+        if no_gating or base_threshold < 1e-6:
+            print(f"Detected model trained without gating mechanism")
+            no_gating = True
+        else:
+            # Print configuration for model identification
+            print(f"Model parameters: αT={base_threshold:.4f}, β={beta:.4f}")
+            print(f"Using {'blockwise' if blockwise else 'global'} coefficients with {num_task_vectors} task vectors")
 
     else:
         # Get feature dimension from dataset if not in config
@@ -281,9 +306,13 @@ def evaluate_model(model_path, dataset, device, args):
         beta = args.beta
         uncertainty_reg = args.uncertainty_reg
         use_augmentation = True
+        no_gating = args.no_gating
 
         # Print inferred parameters
-        print(f"Using default parameters: αT={base_threshold:.4f}, β={beta:.4f}")
+        if args.no_gating:
+            print(f"Using model without gating mechanism")
+        else:
+            print(f"Using default parameters: αT={base_threshold:.4f}, β={beta:.4f}")
 
     # Create model
     try:
@@ -356,7 +385,10 @@ def evaluate_model(model_path, dataset, device, args):
     actual_base_threshold = model.base_threshold.item()
     actual_beta = model.beta.item()
 
-    print(f"Model loaded with: αT={actual_base_threshold:.4f}, β={actual_beta:.4f}")
+    if no_gating:
+        print(f"Model loaded with no gating (αT={actual_base_threshold:.4g}, β={actual_beta:.4g})")
+    else:
+        print(f"Model loaded with: αT={actual_base_threshold:.4f}, β={actual_beta:.4f}")
 
     # Create classifier
     try:
@@ -429,8 +461,13 @@ def evaluate_model(model_path, dataset, device, args):
         first_features, _ = first_batch
         first_features = first_features.to(device)
 
-    gating_ratio = compute_gating_ratio(model, first_features, device)
-    print(f"Actual gating ratio: {gating_ratio:.4f}")
+    # Skip detailed gating analysis for no-gating models
+    if no_gating:
+        gating_ratio = 1.0  # For no-gating models, all coefficients are used
+        print(f"No-gating model: all coefficients used (gating ratio = 1.0)")
+    else:
+        gating_ratio = compute_gating_ratio(model, first_features, device)
+        print(f"Actual gating ratio: {gating_ratio:.4f}")
 
     # Start evaluation
     if args.debug:
@@ -518,15 +555,19 @@ def evaluate_model(model_path, dataset, device, args):
     }
 
     # Determine model type from parameters
-    model_type = "AdaptiveGating"
+    if no_gating:
+        model_type = "MetaNet_NoGating"
+    else:
+        model_type = "AdaptiveGating"
+
     if blockwise:
         model_type += "_Blockwise"
-    if use_augmentation:
-        model_type += "_Augmented"
+    # if use_augmentation:
+    #     model_type += "_Augmented"
 
-    # Get gating stats if available
+    # Get gating stats if available and not in no-gating mode
     gating_stats = None
-    if hasattr(model, 'get_gating_stats'):
+    if not no_gating and hasattr(model, 'get_gating_stats'):
         gating_stats = model.get_gating_stats()
 
     # Compile complete results
@@ -544,7 +585,8 @@ def evaluate_model(model_path, dataset, device, args):
             'base_threshold': actual_base_threshold,
             'beta': actual_beta,
             'uncertainty_reg': uncertainty_reg,
-            'use_augmentation': use_augmentation
+            'use_augmentation': use_augmentation,
+            'no_gating': no_gating
         },
         'model_path': model_path,
         'model_type': model_type,
@@ -552,8 +594,8 @@ def evaluate_model(model_path, dataset, device, args):
         'computed_gating_ratio': gating_ratio
     }
 
-    # Add gating stats if available
-    if gating_stats is not None:
+    # Add gating stats if available and not in no-gating mode
+    if not no_gating and gating_stats is not None:
         results['gating_stats'] = {
             'gating_ratio': gating_stats.get('gating_ratio', 0.0),
             'avg_threshold': gating_stats.get('avg_threshold', 0.0),
@@ -563,7 +605,7 @@ def evaluate_model(model_path, dataset, device, args):
 
     if args.debug:
         print(f"Evaluation complete. Accuracy: {accuracy * 100:.2f}%")
-        if gating_stats is not None:
+        if not no_gating and gating_stats is not None:
             print(f"Gating ratio: {gating_stats.get('gating_ratio', 0.0):.4f}")
 
     return results
@@ -584,7 +626,7 @@ def main():
     print(f"Results will be saved to: {save_dir}")
 
     # Generate descriptive suffix for results
-    config_suffix = "_adaptive_gating"
+    config_suffix = "_no_gating" if args.no_gating else "_adaptive_gating"
     if args.blockwise_coef:
         config_suffix += "_blockwise"
     if args.compare_models:
@@ -594,7 +636,10 @@ def main():
     print(f"\n=== Evaluation Configuration ===")
     print(f"Model: {args.model}")
     print(f"Blockwise coefficients: {args.blockwise_coef}")
-    print(f"Default αT: {args.base_threshold:.4f}, β: {args.beta:.4f}")
+    if args.no_gating:
+        print(f"Mode: MetaNet only (no gating)")
+    else:
+        print(f"Default αT: {args.base_threshold:.4f}, β: {args.beta:.4f}")
     print(f"Number of task vectors: {args.num_task_vectors}")
     print(f"Datasets to evaluate: {args.datasets}")
     print("=" * 30)
@@ -626,10 +671,11 @@ def main():
             )
 
             try:
-                # Find model path
+                # Find model path, looking for no-gating model if specified
                 model_path = find_model_path(
                     args.model_dir,
                     dataset_name,
+                    no_gating=args.no_gating,
                     debug=args.debug
                 )
                 print(f"Using model: {os.path.basename(model_path)}")
@@ -648,13 +694,14 @@ def main():
 
             # Print results
             print(f"Accuracy: {results['accuracy'] * 100:.2f}% ({results['num_correct']}/{results['num_samples']})")
-            print(f"Gating parameters: αT={results['config']['base_threshold']:.4f}, "
-                  f"β={results['config']['beta']:.4f}, "
-                  f"gating ratio={results['computed_gating_ratio']:.4f}")
+            if not args.no_gating:
+                print(f"Gating parameters: αT={results['config']['base_threshold']:.4f}, "
+                    f"β={results['config']['beta']:.4f}, "
+                    f"gating ratio={results['computed_gating_ratio']:.4f}")
 
             # Detailed output if requested
             if args.verbose:
-                if 'gating_stats' in results:
+                if 'gating_stats' in results and not args.no_gating:
                     gating = results['gating_stats']
                     print(f"Gating details - ratio: {gating['gating_ratio']:.4f}, threshold: {gating['avg_threshold']:.4f}")
 
@@ -683,7 +730,8 @@ def main():
                 'samples': results['num_samples'],
                 'alpha': results['config']['base_threshold'],
                 'beta': results['config']['beta'],
-                'gating_ratio': results['computed_gating_ratio']
+                'gating_ratio': results['computed_gating_ratio'],
+                'no_gating': results['config']['no_gating']
             }
 
             summary_results.append(summary_entry)
@@ -715,22 +763,39 @@ def main():
 
     print(f"\nAll evaluation results saved to: {results_path}")
 
-    # Print summary with improved alignment
+    # Print summary with improved alignment and separate sections for gating/no-gating models
     print("\n" + "=" * 80)
-    print(f"{'Dataset':<15} | {'Accuracy':^10} | {'αT':^8} | {'β':^8} | {'Gating %':^10} | {'Model Type':^25}")
+    model_type_str = "MetaNet (No Gating)" if args.no_gating else "Adaptive Gating"
+    print(f"Summary of {model_type_str} Models")
     print("-" * 80)
 
-    for result in sorted(summary_results, key=lambda x: x['dataset']):
-        # Format fields with precise spacing and alignment
-        dataset_field = f"{result['dataset']:<15}"
-        accuracy_field = f"{result['accuracy']*100:>8.2f}%"
-        alpha_field = f"{result['alpha']:>7.4f}"
-        beta_field = f"{result['beta']:>7.4f}"
-        gating_field = f"{result['gating_ratio']*100:>8.2f}%"
-        model_type_field = f"{result['model_type']:<25}"
+    if args.no_gating:
+        print(f"{'Dataset':<15} | {'Accuracy':^10} | {'Model Type':^25}")
+        print("-" * 58)
 
-        # Print with strict alignment using separators
-        print(f"{dataset_field} | {accuracy_field:^10} | {alpha_field:^8} | {beta_field:^8} | {gating_field:^10} | {model_type_field:^25}")
+        for result in sorted(summary_results, key=lambda x: x['dataset']):
+            # Format fields with precise spacing and alignment
+            dataset_field = f"{result['dataset']:<15}"
+            accuracy_field = f"{result['accuracy']*100:>8.2f}%"
+            model_type_field = f"{result['model_type']:<25}"
+
+            # Print with strict alignment using separators
+            print(f"{dataset_field} | {accuracy_field:^10} | {model_type_field:^25}")
+    else:
+        print(f"{'Dataset':<15} | {'Accuracy':^10} | {'αT':^8} | {'β':^8} | {'Gating %':^10} | {'Model Type':^25}")
+        print("-" * 85)
+
+        for result in sorted(summary_results, key=lambda x: x['dataset']):
+            # Format fields with precise spacing and alignment
+            dataset_field = f"{result['dataset']:<15}"
+            accuracy_field = f"{result['accuracy']*100:>8.2f}%"
+            alpha_field = f"{result['alpha']:>7.4f}"
+            beta_field = f"{result['beta']:>7.4f}"
+            gating_field = f"{result['gating_ratio']*100:>8.2f}%"
+            model_type_field = f"{result['model_type']:<25}"
+
+            # Print with strict alignment using separators
+            print(f"{dataset_field} | {accuracy_field:^10} | {alpha_field:^8} | {beta_field:^8} | {gating_field:^10} | {model_type_field:^25}")
 
     print("=" * 80)
 

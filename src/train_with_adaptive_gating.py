@@ -136,8 +136,7 @@ class PrecomputedFeatures:
                  batch_size=128,
                  num_workers=8,
                  persistent_workers=False,
-                 use_augmentation=True,
-                 max_augmentations=None):
+                 use_augmentation=True):
         """
         Initialize with directory containing precomputed features
 
@@ -147,7 +146,6 @@ class PrecomputedFeatures:
             num_workers: Number of worker threads for dataloaders
             persistent_workers: Whether to keep worker processes alive
             use_augmentation: Whether to use augmentations during training
-            max_augmentations: Maximum number of augmentations to load (None for all)
         """
         # Verify directory exists
         if not os.path.exists(feature_dir):
@@ -177,10 +175,6 @@ class PrecomputedFeatures:
             if os.path.exists(aug_feat_path) and os.path.exists(aug_label_path):
                 augmentation_paths.append((aug_feat_path, aug_label_path))
                 aug_idx += 1
-
-                # If max_augmentations is set, limit the number of augmentations
-                if max_augmentations is not None and len(augmentation_paths) >= max_augmentations:
-                    break
             else:
                 break
 
@@ -295,7 +289,7 @@ def evaluate_model(model, classifier, dataset, device):
     return correct / total
 
 
-def plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir):
+def plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir, no_gating=False):
     """Plot and save training metrics (loss curves)"""
     # Create figure for loss plots
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
@@ -303,24 +297,35 @@ def plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir):
     # Plot training loss
     ax1.plot(train_losses, 'r-', linewidth=1.5)
     ax1.set_ylabel('Task Loss', fontsize=14)
-    ax1.set_title(f'Training Loss for {dataset_name}', fontsize=16)
+
+    # Adjust title based on mode
+    mode_str = "MetaNet Only (No Gating)" if no_gating else "Adaptive Gating"
+    ax1.set_title(f'Training Loss for {dataset_name} - {mode_str}', fontsize=16)
     ax1.grid(True, alpha=0.7)
 
     # Plot regularization loss
     ax2.plot(reg_losses, 'g-', linewidth=1.5)
     ax2.set_xlabel('Iterations', fontsize=14)
     ax2.set_ylabel('Regularization Loss', fontsize=14)
-    ax2.set_title(f'Uncertainty Regularization Loss for {dataset_name}', fontsize=16)
+
+    if no_gating:
+        ax2.set_title(f'Regularization Loss for {dataset_name} - No Gating (expected to be zero)', fontsize=16)
+    else:
+        ax2.set_title(f'Uncertainty Regularization Loss for {dataset_name}', fontsize=16)
+
     ax2.grid(True, alpha=0.7)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(plot_dir, f'{dataset_name}_loss_curves.png'), dpi=300)
+
+    # Add suffix to filename based on mode
+    suffix = "_no_gating" if no_gating else ""
+    plt.savefig(os.path.join(plot_dir, f'{dataset_name}{suffix}_loss_curves.png'), dpi=300)
     plt.close()
 
 
 def plot_validation_metrics(val_accuracies, base_threshold_values, beta_values,
                            log_base_threshold_values, log_beta_values,
-                           dataset_name, plot_dir):
+                           dataset_name, plot_dir, no_gating=False):
     """Plot and save validation metrics and parameter evolution"""
     # Create figure for accuracy plot
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -330,7 +335,10 @@ def plot_validation_metrics(val_accuracies, base_threshold_values, beta_values,
             linewidth=2, markersize=8)
     ax.set_xlabel('Epochs', fontsize=14)
     ax.set_ylabel('Accuracy (%)', fontsize=14)
-    ax.set_title(f'Validation Accuracy for {dataset_name}', fontsize=16)
+
+    # Adjust title based on mode
+    mode_str = "MetaNet Only (No Gating)" if no_gating else "Adaptive Gating"
+    ax.set_title(f'Validation Accuracy for {dataset_name} - {mode_str}', fontsize=16)
     ax.grid(True, alpha=0.7)
 
     # Add annotations for key points
@@ -343,8 +351,15 @@ def plot_validation_metrics(val_accuracies, base_threshold_values, beta_values,
                 fontsize=12)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(plot_dir, f'{dataset_name}_accuracy.png'), dpi=300)
+
+    # Add suffix to filename based on mode
+    suffix = "_no_gating" if no_gating else ""
+    plt.savefig(os.path.join(plot_dir, f'{dataset_name}{suffix}_accuracy.png'), dpi=300)
     plt.close()
+
+    # Skip parameter evolution plot in no-gating mode
+    if no_gating:
+        return
 
     # Create figure for parameter evolution
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
@@ -399,11 +414,27 @@ def train_with_adaptive_gating(rank, args):
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
 
+    # Apply no-gating settings if specified
+    if args.no_gating:
+        # Store original values for logging purposes
+        original_base_threshold = args.base_threshold
+        original_beta = args.beta
+        original_uncertainty_reg = args.uncertainty_reg
+
+        # Set very small values to effectively disable gating
+        args.base_threshold = 1e-9
+        args.beta = 1e-9
+        args.uncertainty_reg = 0.0
+
+        if is_main_process():
+            print(f"No-gating mode enabled: base_threshold={args.base_threshold}, beta={args.beta}, uncertainty_reg={args.uncertainty_reg}")
+            print(f"Original values: base_threshold={original_base_threshold}, beta={original_beta}, uncertainty_reg={original_uncertainty_reg}")
+
     # Process specified datasets
-    # datasets_to_process = args.datasets if args.datasets else [
-    #     "Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SUN397", "SVHN"
-    # ]
-    datasets_to_process = args.datasets if args.datasets else ["SVHN"]
+    # datasets_to_process = args.datasets if args.datasets else ["SVHN"]
+    datasets_to_process = args.datasets if args.datasets else [
+        "Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SUN397", "SVHN"
+    ]
 
     # Ensure save directory exists
     os.makedirs(args.save_dir, exist_ok=True)
@@ -416,17 +447,20 @@ def train_with_adaptive_gating(rank, args):
         print(f"Initial αT: {args.base_threshold:.4f}, β: {args.beta:.4f}")
         print(f"Uncertainty regularization: {args.uncertainty_reg}")
         print(f"Using augmentation: {args.use_augmentation}")
-        print(f"Max augmentations: {args.max_augmentations}")
         print(f"Batch size: {args.batch_size}")
         print(f"Learning rate: {args.lr}")
         print(f"Epochs: {args.epochs}")
         print(f"Save directory: {args.save_dir}")
         print(f"Datasets: {datasets_to_process}")
+        print(f"No-gating mode: {args.no_gating}")
         print("=" * 30)
 
     for dataset_name in datasets_to_process:
         if is_main_process():
-            print(f"=== Training on {dataset_name} with adaptive gating ===")
+            if args.no_gating:
+                print(f"=== Training on {dataset_name} with MetaNet only (no gating) ===")
+            else:
+                print(f"=== Training on {dataset_name} with adaptive gating ===")
 
         # Setup save directory for this dataset
         save_dir = os.path.join(args.save_dir, dataset_name + "Val")
@@ -451,7 +485,6 @@ def train_with_adaptive_gating(rank, args):
                 batch_size=args.batch_size,
                 num_workers=2,  # Reduced for stability
                 use_augmentation=args.use_augmentation,
-                max_augmentations=args.max_augmentations
             )
 
             # Get feature dimension from dataset
@@ -509,11 +542,20 @@ def train_with_adaptive_gating(rank, args):
             other_params.extend(list(classifier.parameters()))
 
             # Create parameter groups with different learning rates
-            param_groups = [
-                {'params': gating_log_params, 'lr': args.lr * 100, 'weight_decay': 0.0001},  # Higher LR for gating
-                {'params': meta_net_params, 'lr': args.lr * 2, 'weight_decay': 0.001},       # Higher LR for meta_net
-                {'params': other_params, 'lr': args.lr, 'weight_decay': args.wd}
-            ]
+            # In no-gating mode, use different learning rate strategy
+            if args.no_gating:
+                # For no-gating, we mainly care about meta_net parameters
+                param_groups = [
+                    {'params': meta_net_params, 'lr': args.lr * 3, 'weight_decay': 0.001},  # Higher LR
+                    {'params': gating_log_params, 'lr': args.lr * 0.01, 'weight_decay': 0.0},  # Very low LR
+                    {'params': other_params, 'lr': args.lr, 'weight_decay': args.wd}
+                ]
+            else:
+                param_groups = [
+                    {'params': gating_log_params, 'lr': args.lr * 100, 'weight_decay': 0.0001},  # Higher LR for gating
+                    {'params': meta_net_params, 'lr': args.lr * 2, 'weight_decay': 0.001},       # Higher LR for meta_net
+                    {'params': other_params, 'lr': args.lr, 'weight_decay': args.wd}
+                ]
 
             optimizer = torch.optim.AdamW(param_groups)
 
@@ -576,7 +618,7 @@ def train_with_adaptive_gating(rank, args):
                             # Task loss
                             task_loss = loss_fn(logits, labels)
 
-                            # Add uncertainty regularization
+                            # Add uncertainty regularization (will be effectively 0 in no-gating mode)
                             reg_loss = ddp_model.module.uncertainty_regularization_loss()
 
                             total_loss = task_loss + reg_loss
@@ -617,9 +659,12 @@ def train_with_adaptive_gating(rank, args):
 
                             # Compact progress output with shortened elapsed time
                             t_elapsed = time.time() - start_time
-                            print(f"  Batch {i:4d}/{num_batches:4d} | Loss: {task_loss_cpu:.4f} | "
-                                  f"Reg: {reg_loss_cpu:.4f} | αT: {current_base_threshold:.4f} | "
-                                  f"β: {current_beta:.4f} | Gate: {gating_ratio:.3f} | t: {t_elapsed:.2f}s")
+                            if args.no_gating:
+                                print(f"  Batch {i:4d}/{num_batches:4d} | Loss: {task_loss_cpu:.4f} | t: {t_elapsed:.2f}s")
+                            else:
+                                print(f"  Batch {i:4d}/{num_batches:4d} | Loss: {task_loss_cpu:.4f} | "
+                                      f"Reg: {reg_loss_cpu:.4f} | αT: {current_base_threshold:.4f} | "
+                                      f"β: {current_beta:.4f} | Gate: {gating_ratio:.3f} | t: {t_elapsed:.2f}s")
 
                     except Exception as e:
                         if is_main_process():
@@ -647,8 +692,11 @@ def train_with_adaptive_gating(rank, args):
                     log_beta_values.append(current_log_beta)
 
                     # Epoch summary
-                    print(f"  Summary: Task Loss: {avg_epoch_loss:.4f} | Reg Loss: {avg_epoch_reg_loss:.4f} | "
-                          f"αT: {current_base_threshold:.4f} | β: {current_beta:.4f}")
+                    if args.no_gating:
+                        print(f"  Summary: Task Loss: {avg_epoch_loss:.4f}")
+                    else:
+                        print(f"  Summary: Task Loss: {avg_epoch_loss:.4f} | Reg Loss: {avg_epoch_reg_loss:.4f} | "
+                              f"αT: {current_base_threshold:.4f} | β: {current_beta:.4f}")
 
                 # Evaluate on validation set
                 if is_main_process():
@@ -679,7 +727,8 @@ def train_with_adaptive_gating(rank, args):
                             'log_beta': current_log_beta,
                             'uncertainty_reg': args.uncertainty_reg,
                             'model_name': args.model,
-                            'use_augmentation': args.use_augmentation
+                            'use_augmentation': args.use_augmentation,
+                            'no_gating': args.no_gating
                         }
 
                         best_model_state = {
@@ -690,15 +739,23 @@ def train_with_adaptive_gating(rank, args):
                             'config': config
                         }
 
-                        print(f"  New best model! αT: {current_base_threshold:.4f}, β: {current_beta:.4f}")
+                        if args.no_gating:
+                            print(f"  New best model!")
+                        else:
+                            print(f"  New best model! αT: {current_base_threshold:.4f}, β: {current_beta:.4f}")
 
             # Save results
             if is_main_process():
                 # Save best model
                 if best_model_state:
-                    best_model_path = os.path.join(save_dir, "best_adaptive_gating_model.pt")
+                    # Add suffix based on whether no-gating mode is enabled
+                    model_type_suffix = "_no_gating" if args.no_gating else ""
+                    best_model_path = os.path.join(save_dir, f"best_adaptive_gating{model_type_suffix}_model.pt")
                     print(f"Saving best model to {best_model_path}")
                     torch.save(best_model_state, best_model_path)
+
+                    # Save a copy with standard name for compatibility
+                    torch.save(best_model_state, os.path.join(save_dir, "best_precomputed_model.pt"))
 
                 # Save training history
                 history = {
@@ -712,10 +769,13 @@ def train_with_adaptive_gating(rank, args):
                     'log_beta_values': log_beta_values,
                     'best_acc': best_acc,
                     'config': config if 'config' in locals() else {},
-                    'use_augmentation': args.use_augmentation
+                    'use_augmentation': args.use_augmentation,
+                    'no_gating': args.no_gating
                 }
 
-                with open(os.path.join(save_dir, "adaptive_gating_training_history.json"), 'w') as f:
+                # Use appropriate suffix for the history file
+                model_type_suffix = "_no_gating" if args.no_gating else ""
+                with open(os.path.join(save_dir, f"adaptive_gating{model_type_suffix}_training_history.json"), 'w') as f:
                     # Convert numpy values to Python types
                     for key in history:
                         if isinstance(history[key], (list, dict)) and key not in ['gating_stats']:
@@ -729,15 +789,18 @@ def train_with_adaptive_gating(rank, args):
                 os.makedirs(plot_dir, exist_ok=True)
 
                 # Create plots for loss curves and validation metrics
-                plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir)
+                plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir, no_gating=args.no_gating)
                 plot_validation_metrics(
                     val_accuracies, base_threshold_values, beta_values,
                     log_base_threshold_values, log_beta_values,
-                    dataset_name, plot_dir
+                    dataset_name, plot_dir, no_gating=args.no_gating
                 )
 
-                print(f"Training completed for {dataset_name}. Best validation accuracy: {best_acc*100:.2f}%")
-                print(f"Final parameters - αT: {base_threshold_values[-1]:.4f}, β: {beta_values[-1]:.4f}")
+                # Print completion message
+                mode_str = "MetaNet only (no gating)" if args.no_gating else "adaptive gating"
+                print(f"Training completed for {dataset_name} with {mode_str}. Best validation accuracy: {best_acc*100:.2f}%")
+                if not args.no_gating:
+                    print(f"Final parameters - αT: {base_threshold_values[-1]:.4f}, β: {beta_values[-1]:.4f}")
 
         except Exception as e:
             if is_main_process():

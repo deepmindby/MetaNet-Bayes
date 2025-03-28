@@ -137,6 +137,12 @@ def parse_arguments():
         default=8,
         help="Number of task vectors to simulate"
     )
+    parser.add_argument(
+        "--no-gating",
+        action="store_true",
+        default=False,
+        help="Disable gating mechanism, set beta and base threshold to minimal values"
+    )
 
     # Special evaluation options
     parser.add_argument(
