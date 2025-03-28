@@ -1,12 +1,8 @@
 """
-Argument list
+Argument list for MetaNet-Bayes
 
-Fred Zhang <frederic.zhang@adelaide.edu.au>
-Australian Institute for Machine Learning
-
-Modified from the codebase by Ilharco et al. and Guillermo Ortiz-Jimenez et al.,
-at https://github.com/mlfoundations/task_vectors and
-https://github.com/gortizji/tangent_task_arithmetic
+Enhanced to include all necessary parameters for training and evaluation
+with adaptive gating and augmented features.
 """
 
 import argparse
@@ -14,31 +10,36 @@ import os
 import random
 import torch
 
-def int_or_float(value):
-    if '.' in value:
-        return float(value)
-    return int(value)
-
 def parse_arguments():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="MetaNet-Bayes Arguments")
 
-    def generate_random_port():
-        return random.randint(10000, 20000)
-
-    # Base parameters
+    # Base directory settings
     parser.add_argument(
         "--data-location",
         type=str,
-        default=os.path.expanduser("/home/haichao/zby/MetaNet-Bayes"),
+        default=os.path.expanduser("~/zby/MetaNet-Bayes"),
         help="The root directory for the datasets.",
     )
     parser.add_argument(
-        "--datasets",
+        "--save-dir",
         type=str,
-        nargs="+",
-        choices=["Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SUN397", "SVHN"],
-        help="Which datasets to use for training. If not specified, uses all datasets.",
+        default=os.path.expanduser("~/zby/MetaNet-Bayes/checkpoints_adaptive_gating"),
+        help="Directory to save models and results",
     )
+    parser.add_argument(
+        "--feature-dir",
+        type=str,
+        default=None,
+        help="Explicit directory for precomputed features (overrides data-location)",
+    )
+    parser.add_argument(
+        "--model-dir",
+        type=str,
+        default=os.path.expanduser("~/zby/MetaNet-Bayes/checkpoints_adaptive_gating"),
+        help="Directory with trained models for evaluation",
+    )
+
+    # Model settings
     parser.add_argument(
         "--model",
         type=str,
@@ -46,33 +47,46 @@ def parse_arguments():
         help="The type of model (e.g. RN50, ViT-B-32).",
     )
     parser.add_argument(
+        "--datasets",
+        type=str,
+        nargs="+",
+        default=["Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SUN397", "SVHN"],
+        help="Which datasets to use for training/evaluation",
+    )
+
+    # Training parameters
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=128,
+        help="Batch size for training and evaluation",
     )
     parser.add_argument(
         "--lr",
         type=float,
         default=5e-3,
-        help="Learning rate."
+        help="Learning rate for training"
     )
     parser.add_argument(
         "--wd",
         type=float,
         default=0.01,
-        help="Weight decay"
+        help="Weight decay for training"
     )
     parser.add_argument(
         "--epochs",
         type=int,
         default=20,
+        help="Number of training epochs",
     )
     parser.add_argument(
-        "--save-dir",
-        type=str,
-        default="/home/haichao/zby/MetaNet-Bayes/checkpoints_adaptive_gating",
-        help="Directory to save models and results",
+        "--num-workers",
+        type=int,
+        default=4,
+        help="Number of worker threads for data loading",
     )
+
+    # Distributed training settings
     parser.add_argument(
         "--world-size",
         type=int,
@@ -82,21 +96,21 @@ def parse_arguments():
     parser.add_argument(
         "--port",
         type=int,
-        default=generate_random_port(),
-        help="Port for distributed training. If not specified, a random port will be assigned."
+        default=random.randint(10000, 20000),
+        help="Port for distributed training.",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="Random seed.",
+        help="Random seed for reproducibility.",
     )
 
-    # Adaptive Gating specific parameters
+    # Adaptive Gating parameters
     parser.add_argument(
         "--blockwise-coef",
         action="store_true",
-        default=False,
+        default=True,
         help="Use blockwise coefficients for adaptive gating"
     )
     parser.add_argument(
@@ -123,20 +137,30 @@ def parse_arguments():
         default=8,
         help="Number of task vectors to simulate"
     )
+
+    # Special evaluation options
     parser.add_argument(
-        "--use-augmentation",
+        "--compare-models",
         action="store_true",
-        default=True,
-        help="Whether to use augmented features during training"
+        default=False,
+        help="Compare different model variations"
     )
     parser.add_argument(
-        "--max-augmentations",
-        type=int,
-        default=None,
-        help="Maximum number of augmentation versions to use (None for all)"
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Provide detailed output during evaluation"
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Enable debug mode with additional logging"
     )
 
     parsed_args = parser.parse_args()
     parsed_args.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    parsed_args.use_augmentation = True
 
     return parsed_args
