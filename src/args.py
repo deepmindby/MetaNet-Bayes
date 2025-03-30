@@ -169,6 +169,13 @@ def parse_arguments():
         default=False,
         help="Remove MetaNet and use original Atlas implementation with precomputed features"
     )
+    parser.add_argument(
+        "--finetuning-mode",
+        type=str,
+        default="standard",
+        choices=["standard", "linear"],
+        help="Model finetuning mode: 'standard' or 'linear'",
+    )
 
     parsed_args = parser.parse_args()
     parsed_args.device = "cuda" if torch.cuda.is_available() else "cpu"

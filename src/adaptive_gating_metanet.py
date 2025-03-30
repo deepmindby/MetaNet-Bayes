@@ -408,12 +408,15 @@ class AdaptiveGatingMetaNet(nn.Module):
         threshold_reg = -torch.log(threshold_dist.clamp(min=1e-5)) * 0.01
 
         # Combine all losses
-        total_loss = uncertainty_loss + margin_loss + beta_reg + threshold_reg
+        # total_loss = uncertainty_loss + margin_loss + beta_reg + threshold_reg
+        # total_loss = uncertainty_loss + margin_loss
+        total_loss = uncertainty_loss
 
         # Add direct dependencies on parameters for update
-        param_reg = self.log_base_threshold.abs() * 0.0001 + self.log_beta.abs() * 0.0001
+        # param_reg = self.log_base_threshold.abs() * 0.0001 + self.log_beta.abs() * 0.0001
+        # param_reg = 0
 
-        return total_loss + param_reg + 1e-6
+        return total_loss + 1e-6
 
     def get_gating_stats(self):
         """Get statistics about the gating process for monitoring

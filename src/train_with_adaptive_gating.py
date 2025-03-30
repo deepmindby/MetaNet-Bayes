@@ -1,7 +1,8 @@
 """Optimized Training Script Using Pre-computed Features
 
 This script provides an optimized approach to training models using pre-computed
-CLIP features with a clean and direct path handling strategy.
+CLIP features with a clean and direct path handling strategy. Supports training
+with MetaNet, adaptive gating, or direct feature approach (Atlas).
 """
 
 import os
@@ -23,6 +24,73 @@ from src.distributed import cleanup_ddp, distribute_loader, is_main_process, set
 
 from src.args import parse_arguments
 args = parse_arguments()
+
+
+class DirectFeatureModel(torch.nn.Module):
+    """
+    A direct feature model that passes features directly to classifier without MetaNet transformations.
+    This implements the Atlas approach using precomputed features.
+    """
+    def __init__(self, feature_dim):
+        """Initialize DirectFeatureModel
+
+        Parameters:
+        ----------
+        feature_dim: int
+            Dimension of the pre-computed feature vectors
+        """
+        super().__init__()
+        self.feature_dim = feature_dim
+        # Identity projection (no transformation)
+        self.projection = torch.nn.Identity()
+
+        # Add a dummy parameter with requires_grad=True to ensure DDP works
+        # This parameter won't affect forward computation
+        self.dummy_param = torch.nn.Parameter(torch.zeros(1), requires_grad=True)
+
+        # Small linear layer that won't affect output (scaled by zero)
+        # This ensures we have trainable parameters for DDP
+        self.dummy_linear = torch.nn.Linear(feature_dim, feature_dim)
+        # Initialize to near-zero weights
+        torch.nn.init.zeros_(self.dummy_linear.weight)
+        torch.nn.init.zeros_(self.dummy_linear.bias)
+
+    def forward(self, features):
+        """Forward pass simply passes features through
+
+        Parameters:
+        ----------
+        features: Tensor [batch_size, feature_dim]
+            Pre-computed feature vectors
+
+        Returns:
+        ----------
+        features: Tensor [batch_size, feature_dim]
+            Same features, unchanged (dummy computation has no effect)
+        """
+        # Apply the identity projection + add scaled dummy computation (scaling factor = 0)
+        return self.projection(features) + self.dummy_linear(features) * 0.0
+
+    def uncertainty_regularization_loss(self):
+        """Dummy method to match AdaptiveGatingMetaNet interface
+
+        Returns:
+        ----------
+        loss: Tensor
+            Zero tensor for compatibility
+        """
+        # Return a small loss based on dummy parameter to ensure it receives gradient
+        return self.dummy_param.sum() * 0.0  # Multiply by 0 to not affect actual training
+
+    def get_gating_stats(self):
+        """Dummy method to match AdaptiveGatingMetaNet interface
+
+        Returns:
+        ----------
+        stats: dict
+            Empty dictionary for compatibility
+        """
+        return {}
 
 
 class PrecomputedFeatureDataset(torch.utils.data.Dataset):
@@ -289,7 +357,7 @@ def evaluate_model(model, classifier, dataset, device):
     return correct / total
 
 
-def plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir, no_gating=False):
+def plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir, no_gating=False, no_metanet=False):
     """Plot and save training metrics (loss curves)"""
     # Create figure for loss plots
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
@@ -299,7 +367,13 @@ def plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir, no_g
     ax1.set_ylabel('Task Loss', fontsize=14)
 
     # Adjust title based on mode
-    mode_str = "MetaNet Only (No Gating)" if no_gating else "Adaptive Gating"
+    if no_metanet:
+        mode_str = "Atlas (No MetaNet)"
+    elif no_gating:
+        mode_str = "MetaNet Only (No Gating)"
+    else:
+        mode_str = "Adaptive Gating MetaNet"
+
     ax1.set_title(f'Training Loss for {dataset_name} - {mode_str}', fontsize=16)
     ax1.grid(True, alpha=0.7)
 
@@ -308,7 +382,9 @@ def plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir, no_g
     ax2.set_xlabel('Iterations', fontsize=14)
     ax2.set_ylabel('Regularization Loss', fontsize=14)
 
-    if no_gating:
+    if no_metanet:
+        ax2.set_title(f'Regularization Loss for {dataset_name} - Atlas (expected to be zero)', fontsize=16)
+    elif no_gating:
         ax2.set_title(f'Regularization Loss for {dataset_name} - No Gating (expected to be zero)', fontsize=16)
     else:
         ax2.set_title(f'Uncertainty Regularization Loss for {dataset_name}', fontsize=16)
@@ -318,14 +394,20 @@ def plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir, no_g
     plt.tight_layout()
 
     # Add suffix to filename based on mode
-    suffix = "_no_gating" if no_gating else ""
+    if no_metanet:
+        suffix = "_no_metanet"
+    elif no_gating:
+        suffix = "_no_gating"
+    else:
+        suffix = ""
+
     plt.savefig(os.path.join(plot_dir, f'{dataset_name}{suffix}_loss_curves.png'), dpi=300)
     plt.close()
 
 
 def plot_validation_metrics(val_accuracies, base_threshold_values, beta_values,
                            log_base_threshold_values, log_beta_values,
-                           dataset_name, plot_dir, no_gating=False):
+                           dataset_name, plot_dir, no_gating=False, no_metanet=False):
     """Plot and save validation metrics and parameter evolution"""
     # Create figure for accuracy plot
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -337,7 +419,13 @@ def plot_validation_metrics(val_accuracies, base_threshold_values, beta_values,
     ax.set_ylabel('Accuracy (%)', fontsize=14)
 
     # Adjust title based on mode
-    mode_str = "MetaNet Only (No Gating)" if no_gating else "Adaptive Gating"
+    if no_metanet:
+        mode_str = "Atlas (No MetaNet)"
+    elif no_gating:
+        mode_str = "MetaNet Only (No Gating)"
+    else:
+        mode_str = "Adaptive Gating MetaNet"
+
     ax.set_title(f'Validation Accuracy for {dataset_name} - {mode_str}', fontsize=16)
     ax.grid(True, alpha=0.7)
 
@@ -353,12 +441,18 @@ def plot_validation_metrics(val_accuracies, base_threshold_values, beta_values,
     plt.tight_layout()
 
     # Add suffix to filename based on mode
-    suffix = "_no_gating" if no_gating else ""
+    if no_metanet:
+        suffix = "_no_metanet"
+    elif no_gating:
+        suffix = "_no_gating"
+    else:
+        suffix = ""
+
     plt.savefig(os.path.join(plot_dir, f'{dataset_name}{suffix}_accuracy.png'), dpi=300)
     plt.close()
 
-    # Skip parameter evolution plot in no-gating mode
-    if no_gating:
+    # Skip parameter evolution plot in no-metanet or no-gating mode
+    if no_metanet or no_gating:
         return
 
     # Create figure for parameter evolution
@@ -415,7 +509,7 @@ def train_with_adaptive_gating(rank, args):
             torch.cuda.manual_seed_all(args.seed)
 
     # Apply no-gating settings if specified
-    if args.no_gating:
+    if args.no_gating and not args.no_metanet:
         # Store original values for logging purposes
         original_base_threshold = args.base_threshold
         original_beta = args.beta
@@ -443,21 +537,29 @@ def train_with_adaptive_gating(rank, args):
     if rank == 0:
         print(f"\n=== Training Configuration ===")
         print(f"Model: {args.model}")
-        print(f"Using blockwise coefficients: {args.blockwise_coef}")
-        print(f"Initial αT: {args.base_threshold:.4f}, β: {args.beta:.4f}")
-        print(f"Uncertainty regularization: {args.uncertainty_reg}")
+        print(f"Using MetaNet: {not args.no_metanet}")
+        if not args.no_metanet:
+            print(f"Using blockwise coefficients: {args.blockwise_coef}")
+            if not args.no_gating:
+                print(f"Initial αT: {args.base_threshold:.4f}, β: {args.beta:.4f}")
+                print(f"Uncertainty regularization: {args.uncertainty_reg}")
+            else:
+                print(f"No-gating mode: True")
+        else:
+            print(f"Using Atlas implementation (direct features)")
         print(f"Using augmentation: {args.use_augmentation}")
         print(f"Batch size: {args.batch_size}")
         print(f"Learning rate: {args.lr}")
         print(f"Epochs: {args.epochs}")
         print(f"Save directory: {args.save_dir}")
         print(f"Datasets: {datasets_to_process}")
-        print(f"No-gating mode: {args.no_gating}")
         print("=" * 30)
 
     for dataset_name in datasets_to_process:
         if is_main_process():
-            if args.no_gating:
+            if args.no_metanet:
+                print(f"=== Training on {dataset_name} with Atlas (no MetaNet) ===")
+            elif args.no_gating:
                 print(f"=== Training on {dataset_name} with MetaNet only (no gating) ===")
             else:
                 print(f"=== Training on {dataset_name} with adaptive gating ===")
@@ -494,15 +596,26 @@ def train_with_adaptive_gating(rank, args):
             if is_main_process():
                 print(f"Feature dimension: {feature_dim}")
 
-            # Create adaptive gating model
-            model = AdaptiveGatingMetaNet(
-                feature_dim=feature_dim,
-                task_vectors=args.num_task_vectors,
-                blockwise=args.blockwise_coef,
-                base_threshold=args.base_threshold,
-                beta=args.beta,
-                uncertainty_reg=args.uncertainty_reg
-            )
+            # Create model based on selected approach
+            if args.no_metanet:
+                # Create direct feature model (Atlas approach)
+                model = DirectFeatureModel(feature_dim=feature_dim)
+                if is_main_process():
+                    print(f"Created DirectFeatureModel (Atlas approach)")
+            else:
+                # Create adaptive gating model (with or without gating)
+                model = AdaptiveGatingMetaNet(
+                    feature_dim=feature_dim,
+                    task_vectors=args.num_task_vectors,
+                    blockwise=args.blockwise_coef,
+                    base_threshold=args.base_threshold,
+                    beta=args.beta,
+                    uncertainty_reg=args.uncertainty_reg
+                )
+                if is_main_process():
+                    model_type = "with adaptive gating" if not args.no_gating else "without gating"
+                    print(f"Created AdaptiveGatingMetaNet {model_type}")
+
             model = model.to(rank)
 
             data_loader = dataset.train_loader
@@ -529,21 +642,30 @@ def train_with_adaptive_gating(rank, args):
             meta_net_params = []
             other_params = []
 
-            # Separate parameters by type
-            for name, param in ddp_model.named_parameters():
-                if 'log_beta' in name or 'log_base_threshold' in name:
-                    gating_log_params.append(param)
-                elif 'meta_net' in name:
-                    meta_net_params.append(param)
-                else:
-                    other_params.append(param)
+            # Separate parameters by type - handle different model types
+            if args.no_metanet:
+                # For Atlas, all parameters go to other_params
+                other_params = list(ddp_model.parameters()) + list(classifier.parameters())
+            else:
+                # For MetaNet variants, separate parameter types
+                for name, param in ddp_model.named_parameters():
+                    if 'log_beta' in name or 'log_base_threshold' in name:
+                        gating_log_params.append(param)
+                    elif 'meta_net' in name:
+                        meta_net_params.append(param)
+                    else:
+                        other_params.append(param)
 
-            # Add classifier parameters
-            other_params.extend(list(classifier.parameters()))
+                # Add classifier parameters
+                other_params.extend(list(classifier.parameters()))
 
-            # Create parameter groups with different learning rates
-            # In no-gating mode, use different learning rate strategy
-            if args.no_gating:
+            # Create parameter groups with different learning rates based on model type
+            if args.no_metanet:
+                # Simple parameter group for Atlas
+                param_groups = [
+                    {'params': other_params, 'lr': args.lr, 'weight_decay': args.wd}
+                ]
+            elif args.no_gating:
                 # For no-gating, we mainly care about meta_net parameters
                 param_groups = [
                     {'params': meta_net_params, 'lr': args.lr * 3, 'weight_decay': 0.001},  # Higher LR
@@ -552,7 +674,7 @@ def train_with_adaptive_gating(rank, args):
                 ]
             else:
                 param_groups = [
-                    {'params': gating_log_params, 'lr': args.lr * 100, 'weight_decay': 0.0001},  # Higher LR for gating
+                    {'params': gating_log_params, 'lr': args.lr * 50, 'weight_decay': 0.0001},  # Higher LR for gating
                     {'params': meta_net_params, 'lr': args.lr * 2, 'weight_decay': 0.001},       # Higher LR for meta_net
                     {'params': other_params, 'lr': args.lr, 'weight_decay': args.wd}
                 ]
@@ -618,7 +740,8 @@ def train_with_adaptive_gating(rank, args):
                             # Task loss
                             task_loss = loss_fn(logits, labels)
 
-                            # Add uncertainty regularization (will be effectively 0 in no-gating mode)
+                            # Add uncertainty regularization
+                            # Will be effectively 0 for Atlas or no-gating models
                             reg_loss = ddp_model.module.uncertainty_regularization_loss()
 
                             total_loss = task_loss + reg_loss
@@ -645,26 +768,28 @@ def train_with_adaptive_gating(rank, args):
 
                         # Print progress (only with reduced frequency)
                         if i % print_every == 0 and is_main_process():
-                            # Get current gating parameters
-                            current_base_threshold = float(ddp_model.module.base_threshold.item())
-                            current_beta = float(ddp_model.module.beta.item())
+                            # Get current gating parameters if applicable
+                            if not args.no_metanet and not args.no_gating:
+                                current_base_threshold = float(ddp_model.module.base_threshold.item())
+                                current_beta = float(ddp_model.module.beta.item())
 
-                            # Get gating statistics if available
-                            gating_ratio = 0.0
-                            if hasattr(ddp_model.module, 'get_gating_stats'):
-                                stats = ddp_model.module.get_gating_stats()
-                                if stats:
-                                    gating_stats.append(stats)
-                                    gating_ratio = stats.get('gating_ratio', 0.0)
+                                # Get gating statistics if available
+                                gating_ratio = 0.0
+                                if hasattr(ddp_model.module, 'get_gating_stats'):
+                                    stats = ddp_model.module.get_gating_stats()
+                                    if stats:
+                                        gating_stats.append(stats)
+                                        gating_ratio = stats.get('gating_ratio', 0.0)
 
-                            # Compact progress output with shortened elapsed time
-                            t_elapsed = time.time() - start_time
-                            if args.no_gating:
-                                print(f"  Batch {i:4d}/{num_batches:4d} | Loss: {task_loss_cpu:.4f} | t: {t_elapsed:.2f}s")
-                            else:
+                                # Detailed output for gating model
                                 print(f"  Batch {i:4d}/{num_batches:4d} | Loss: {task_loss_cpu:.4f} | "
                                       f"Reg: {reg_loss_cpu:.4f} | αT: {current_base_threshold:.4f} | "
-                                      f"β: {current_beta:.4f} | Gate: {gating_ratio:.3f} | t: {t_elapsed:.2f}s")
+                                      f"β: {current_beta:.4f} | Gate: {gating_ratio:.3f} | "
+                                      f"t: {time.time() - start_time:.2f}s")
+                            else:
+                                # Compact output for no-gating or Atlas models
+                                print(f"  Batch {i:4d}/{num_batches:4d} | Loss: {task_loss_cpu:.4f} | "
+                                      f"t: {time.time() - start_time:.2f}s")
 
                     except Exception as e:
                         if is_main_process():
@@ -677,26 +802,31 @@ def train_with_adaptive_gating(rank, args):
                 avg_epoch_loss = epoch_loss / batch_count if batch_count > 0 else 0
                 avg_epoch_reg_loss = epoch_reg_loss / batch_count if batch_count > 0 else 0
 
-                # Record parameter values at the end of each epoch
+                # Record parameter values at the end of each epoch for gating models
                 if is_main_process():
-                    # Get current parameters
-                    current_base_threshold = float(ddp_model.module.base_threshold.item())
-                    current_beta = float(ddp_model.module.beta.item())
-                    current_log_base_threshold = float(ddp_model.module.log_base_threshold.item())
-                    current_log_beta = float(ddp_model.module.log_beta.item())
+                    # For gating models, track parameter evolution
+                    if not args.no_metanet and not args.no_gating:
+                        current_base_threshold = float(ddp_model.module.base_threshold.item())
+                        current_beta = float(ddp_model.module.beta.item())
+                        current_log_base_threshold = float(ddp_model.module.log_base_threshold.item())
+                        current_log_beta = float(ddp_model.module.log_beta.item())
 
-                    # Save to lists
-                    base_threshold_values.append(current_base_threshold)
-                    beta_values.append(current_beta)
-                    log_base_threshold_values.append(current_log_base_threshold)
-                    log_beta_values.append(current_log_beta)
+                        # Save to lists
+                        base_threshold_values.append(current_base_threshold)
+                        beta_values.append(current_beta)
+                        log_base_threshold_values.append(current_log_base_threshold)
+                        log_beta_values.append(current_log_beta)
 
-                    # Epoch summary
-                    if args.no_gating:
-                        print(f"  Summary: Task Loss: {avg_epoch_loss:.4f}")
-                    else:
+                        # Epoch summary with gating parameters
                         print(f"  Summary: Task Loss: {avg_epoch_loss:.4f} | Reg Loss: {avg_epoch_reg_loss:.4f} | "
                               f"αT: {current_base_threshold:.4f} | β: {current_beta:.4f}")
+                    else:
+                        # For no-gating or Atlas models, simpler summary
+                        base_threshold_values.append(0.0)  # Placeholder values
+                        beta_values.append(0.0)
+                        log_base_threshold_values.append(0.0)
+                        log_beta_values.append(0.0)
+                        print(f"  Summary: Task Loss: {avg_epoch_loss:.4f}")
 
                 # Evaluate on validation set
                 if is_main_process():
@@ -717,19 +847,46 @@ def train_with_adaptive_gating(rank, args):
                         best_acc = val_acc
 
                         # Store model configuration along with weights
-                        config = {
-                            'feature_dim': feature_dim,
-                            'num_task_vectors': args.num_task_vectors,
-                            'blockwise': args.blockwise_coef,
-                            'base_threshold': current_base_threshold,
-                            'beta': current_beta,
-                            'log_base_threshold': current_log_base_threshold,
-                            'log_beta': current_log_beta,
-                            'uncertainty_reg': args.uncertainty_reg,
-                            'model_name': args.model,
-                            'use_augmentation': args.use_augmentation,
-                            'no_gating': args.no_gating
-                        }
+                        if args.no_metanet:
+                            # Configuration for Atlas model
+                            config = {
+                                'feature_dim': feature_dim,
+                                'no_metanet': True,
+                                'model_name': args.model,
+                                'use_augmentation': args.use_augmentation
+                            }
+                        elif args.no_gating:
+                            # Configuration for no-gating MetaNet
+                            config = {
+                                'feature_dim': feature_dim,
+                                'num_task_vectors': args.num_task_vectors,
+                                'blockwise': args.blockwise_coef,
+                                'base_threshold': 0.0,  # Use zero values for no-gating
+                                'beta': 0.0,
+                                'log_base_threshold': 0.0,
+                                'log_beta': 0.0,
+                                'uncertainty_reg': 0.0,
+                                'model_name': args.model,
+                                'use_augmentation': args.use_augmentation,
+                                'no_gating': True,
+                                'no_metanet': False
+                            }
+                        else:
+                            # Configuration for adaptive gating MetaNet
+                            config = {
+                                'feature_dim': feature_dim,
+                                'num_task_vectors': args.num_task_vectors,
+                                'blockwise': args.blockwise_coef,
+                                'base_threshold': current_base_threshold,
+                                'beta': current_beta,
+                                'log_base_threshold': current_log_base_threshold,
+                                'log_beta': current_log_beta,
+                                'uncertainty_reg': args.uncertainty_reg,
+                                'model_name': args.model,
+                                'use_augmentation': args.use_augmentation,
+                                'no_gating': False,
+                                'no_metanet': False
+                            }
 
                         best_model_state = {
                             'meta_net': ddp_model.module.state_dict(),
@@ -739,18 +896,26 @@ def train_with_adaptive_gating(rank, args):
                             'config': config
                         }
 
-                        if args.no_gating:
-                            print(f"  New best model!")
+                        # Print appropriate message based on model type
+                        if args.no_metanet:
+                            print(f"  New best model! (Atlas approach)")
+                        elif args.no_gating:
+                            print(f"  New best model! (MetaNet without gating)")
                         else:
                             print(f"  New best model! αT: {current_base_threshold:.4f}, β: {current_beta:.4f}")
 
             # Save results
             if is_main_process():
-                # Save best model
+                # Save best model with appropriate filename suffix
+                if args.no_metanet:
+                    model_type_suffix = "_atlas"
+                elif args.no_gating:
+                    model_type_suffix = "_no_gating"
+                else:
+                    model_type_suffix = "_adaptive_gating"
+
                 if best_model_state:
-                    # Add suffix based on whether no-gating mode is enabled
-                    model_type_suffix = "_no_gating" if args.no_gating else ""
-                    best_model_path = os.path.join(save_dir, f"best_adaptive_gating{model_type_suffix}_model.pt")
+                    best_model_path = os.path.join(save_dir, f"best{model_type_suffix}_model.pt")
                     print(f"Saving best model to {best_model_path}")
                     torch.save(best_model_state, best_model_path)
 
@@ -770,12 +935,14 @@ def train_with_adaptive_gating(rank, args):
                     'best_acc': best_acc,
                     'config': config if 'config' in locals() else {},
                     'use_augmentation': args.use_augmentation,
-                    'no_gating': args.no_gating
+                    'no_gating': args.no_gating,
+                    'no_metanet': args.no_metanet
                 }
 
                 # Use appropriate suffix for the history file
-                model_type_suffix = "_no_gating" if args.no_gating else ""
-                with open(os.path.join(save_dir, f"adaptive_gating{model_type_suffix}_training_history.json"), 'w') as f:
+                history_path = os.path.join(save_dir, f"{model_type_suffix.strip('_')}_training_history.json")
+
+                with open(history_path, 'w') as f:
                     # Convert numpy values to Python types
                     for key in history:
                         if isinstance(history[key], (list, dict)) and key not in ['gating_stats']:
@@ -785,21 +952,32 @@ def train_with_adaptive_gating(rank, args):
                     json.dump(history, f, indent=4)
 
                 # Create plots directory
-                plot_dir = os.path.join(args.save_dir, "adaptive_gating_plots")
+                plot_dir = os.path.join(args.save_dir, "training_plots")
                 os.makedirs(plot_dir, exist_ok=True)
 
                 # Create plots for loss curves and validation metrics
-                plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir, no_gating=args.no_gating)
+                plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir,
+                                     no_gating=args.no_gating, no_metanet=args.no_metanet)
+
                 plot_validation_metrics(
                     val_accuracies, base_threshold_values, beta_values,
                     log_base_threshold_values, log_beta_values,
-                    dataset_name, plot_dir, no_gating=args.no_gating
+                    dataset_name, plot_dir,
+                    no_gating=args.no_gating, no_metanet=args.no_metanet
                 )
 
-                # Print completion message
-                mode_str = "MetaNet only (no gating)" if args.no_gating else "adaptive gating"
+                # Print completion message with appropriate model description
+                if args.no_metanet:
+                    mode_str = "Atlas approach (no MetaNet)"
+                elif args.no_gating:
+                    mode_str = "MetaNet only (no gating)"
+                else:
+                    mode_str = "adaptive gating"
+
                 print(f"Training completed for {dataset_name} with {mode_str}. Best validation accuracy: {best_acc*100:.2f}%")
-                if not args.no_gating:
+
+                # Print final parameters for gating models
+                if not args.no_metanet and not args.no_gating:
                     print(f"Final parameters - αT: {base_threshold_values[-1]:.4f}, β: {beta_values[-1]:.4f}")
 
         except Exception as e:

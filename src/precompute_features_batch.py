@@ -7,6 +7,7 @@ This script provides a robust approach to feature extraction by:
 3. Aggressively managing memory
 4. Supporting GPU device selection with automatic fallback
 5. Supporting multiple augmented versions of features
+6. Supporting linear model feature extraction
 """
 
 import os
@@ -27,6 +28,9 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 from src.modeling import ImageEncoder
 from src.datasets.registry import get_dataset
+
+import torch.multiprocessing as mp
+mp.set_sharing_strategy('file_system')
 
 # Global variables
 current_batch = 0
@@ -492,6 +496,8 @@ def parse_args():
                         help="Number of augmented versions to create (0 for none)")
     parser.add_argument("--start-augmentation", type=int, default=1,
                         help="Starting index for augmentation (default: 1)")
+    parser.add_argument("--linear", action="store_true",
+                        help="Use linearized model for feature extraction")
     return parser.parse_args()
 
 def main():
@@ -505,21 +511,28 @@ def main():
         num_gpus = torch.cuda.device_count()
         log_info(f"Found {num_gpus} GPUs available")
         if args.gpu_id >= num_gpus:
-            log_info(f"Warning: Requested GPU {args.gpu_id} but only {num_gpus} GPUs available. Using GPU 0 instead.")
+            log_info(f"Warning: Requested GPU {gpu_id} but only {num_gpus} GPUs available. Using GPU 0 instead.")
             args.gpu_id = 0
     else:
         log_info("Warning: CUDA not available, using CPU instead")
         args.gpu_id = -1  # Use CPU
 
-    # Create directory
-    model_save_dir = os.path.join(args.save_dir, args.model)
-    log_info(f"Features will be saved to: {model_save_dir}")
+    # Create directory with linear subdirectory if using linear model
+    if args.linear:
+        model_save_dir = os.path.join(args.save_dir, args.model, "linear")
+        log_info(f"Features will be saved to: {model_save_dir} (linearized model)")
+    else:
+        model_save_dir = os.path.join(args.save_dir, args.model)
+        log_info(f"Features will be saved to: {model_save_dir}")
+
     os.makedirs(model_save_dir, exist_ok=True)
 
     # Log execution information
     with open(os.path.join(model_save_dir, "model_info.txt"), "a") as f:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         f.write(f"[{timestamp}] Processing dataset: {args.dataset}\n")
+        if args.linear:
+            f.write(f"[{timestamp}] Using linearized model\n")
         if args.num_augmentations > 0:
             f.write(f"[{timestamp}] Creating {args.num_augmentations} augmented versions\n")
 
@@ -531,7 +544,15 @@ def main():
         "cache_dir": None
     })
 
-    image_encoder = ImageEncoder(model_args)
+    if args.linear:
+        # Import linearized model class and create linearized model
+        from src.linearized import LinearizedImageEncoder
+        log_info(f"Using linearized version of {args.model}")
+        image_encoder = LinearizedImageEncoder(model_args)
+    else:
+        # Standard model initialization
+        from src.modeling import ImageEncoder
+        image_encoder = ImageEncoder(model_args)
 
     # Process dataset with robust error handling
     success = extract_and_save_features(

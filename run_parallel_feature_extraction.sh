@@ -7,7 +7,7 @@
 # 设置基本参数
 SAVE_DIR="/home/haichao/zby/MetaNet-Bayes/precomputed_features"
 DATA_LOCATION="/home/haichao/zby/MetaNet-Bayes/data"
-MODEL="ViT-B-32"
+MODEL="ViT-L-14"
 BATCH_SIZE=64  # 通用批次大小
 TIME_LIMITS=36000
 NUM_AUGMENTATIONS=10  # 每个数据集创建的增强版本数量
@@ -20,7 +20,7 @@ echo "检测到 $GPU_COUNT 个可用GPU"
 mkdir -p $SAVE_DIR
 
 # 定义数据集列表 - 所有数据集统一处理
-# DATASETS="Cars DTD EuroSAT GTSRB MNIST RESISC45 SVHN SUN397"
+# DATASETS="Cars DTD EuroSAT GTSRB MNIST RESISC45 SVHN"
 DATASETS="SUN397"
 
 # 创建日志目录
@@ -93,6 +93,7 @@ for i in {0..7}; do
     echo "处理数据集 $DATASET 在 GPU $GPU_ID，创建 $NUM_AUGMENTATIONS 个增强版本，日志: $LOG_FILE"
 
     # 标准处理 - 所有数据集使用统一方法
+    # --gpu-id $GPU_ID
     (
         timeout $TIMEOUT python src/precompute_features_batch.py \
             --model $MODEL \
@@ -100,7 +101,7 @@ for i in {0..7}; do
             --data-location $DATA_LOCATION \
             --batch-size $CURR_BATCH_SIZE \
             --dataset $DATASET \
-            --gpu-id $GPU_ID \
+            --gpu-id 7 \
             --batch-timeout $BATCH_TIMEOUT \
             --num-augmentations $NUM_AUGMENTATIONS \
             --verbose > $LOG_FILE 2>&1
