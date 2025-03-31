@@ -44,7 +44,7 @@ def parse_arguments():
         "--model",
         type=str,
         default="ViT-B-32",
-        help="The type of model (e.g. RN50, ViT-B-32).",
+        help="The type of model (e.g. RN50, RN101, ViT-B-32). Supports ResNet50 (RN50), ResNet101 (RN101) and ViT models.",
     )
     parser.add_argument(
         "--datasets",

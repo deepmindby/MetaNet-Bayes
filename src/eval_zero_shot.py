@@ -145,7 +145,7 @@ def get_test_dataset(dataset_name, model_name, location, batch_size=128, num_wor
     if dataset_name.endswith("Val"):
         base_name = dataset_name[:-3]
 
-    # Try common paths
+    # Try model-specific paths first
     feature_dir = os.path.join(location, "precomputed_features", model_name, dataset_name)
 
     # Try alternative paths if needed
@@ -155,8 +155,18 @@ def get_test_dataset(dataset_name, model_name, location, batch_size=128, num_wor
     if not os.path.exists(feature_dir):
         feature_dir = os.path.join(location, "precomputed_features", model_name, base_name + "Val")
 
+    # Fall back to generic paths if model-specific ones don't exist
     if not os.path.exists(feature_dir):
-        raise FileNotFoundError(f"Features for {dataset_name} not found in {location}")
+        feature_dir = os.path.join(location, "precomputed_features", dataset_name)
+
+    if not os.path.exists(feature_dir):
+        feature_dir = os.path.join(location, "precomputed_features", base_name)
+
+    if not os.path.exists(feature_dir):
+        feature_dir = os.path.join(location, "precomputed_features", base_name + "Val")
+
+    if not os.path.exists(feature_dir):
+        raise FileNotFoundError(f"Features for {dataset_name} with model {model_name} not found in {location}")
 
     # Create dataset
     return TestOnlyFeatures(
@@ -256,7 +266,23 @@ def evaluate_zero_shot(dataset, device, args):
     # Calculate overall accuracy
     accuracy = correct / total if total > 0 else 0.0
 
-    return accuracy, correct, total
+    # Calculate per-class accuracy
+    per_class_acc = {}
+    for cls_idx in range(len(dataset.classnames)):
+        cls_name = dataset.classnames[cls_idx]
+        if per_class_total[cls_idx] > 0:
+            cls_acc = per_class_correct[cls_idx] / per_class_total[cls_idx]
+            per_class_acc[cls_name] = float(cls_acc)
+
+    results = {
+        'accuracy': accuracy,
+        'correct': correct,
+        'total': total,
+        'per_class_accuracy': per_class_acc,
+        'model_name': args.model  # Include model name for reference
+    }
+
+    return results
 
 
 def parse_args():
@@ -278,6 +304,8 @@ def parse_args():
                         help="Use multiple prompts and average results")
     parser.add_argument("--debug", action="store_true", default=False,
                         help="Enable debug mode")
+    parser.add_argument("--save-dir", type=str, default="zero_shot_results",
+                        help="Directory to save evaluation results")
     return parser.parse_args()
 
 
@@ -289,6 +317,11 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    # Create model-specific save directory
+    model_save_dir = os.path.join(args.save_dir, args.model)
+    os.makedirs(model_save_dir, exist_ok=True)
+    print(f"Results will be saved to: {model_save_dir}")
+
     # Print configuration
     print(f"\n=== Zero-shot Evaluation Configuration ===")
     print(f"Model: {args.model}")
@@ -297,7 +330,8 @@ def main():
     print("=" * 50)
 
     # Overall results
-    results = []
+    all_results = {}
+    summary_results = []
 
     for dataset_name in args.datasets:
         print(f"Evaluating dataset: {dataset_name}")
@@ -315,17 +349,19 @@ def main():
             )
 
             # Evaluate using zero-shot approach
-            accuracy, correct, total = evaluate_zero_shot(dataset, device, args)
+            results = evaluate_zero_shot(dataset, device, args)
 
             # Print results
-            print(f"Zero-shot accuracy: {accuracy * 100:.2f}% ({correct}/{total})")
+            print(f"Zero-shot accuracy: {results['accuracy'] * 100:.2f}% ({results['correct']}/{results['total']})")
 
             # Add to results
-            results.append({
+            all_results[dataset_name] = results
+            summary_results.append({
                 'dataset': dataset_name,
-                'accuracy': accuracy,
-                'correct': correct,
-                'total': total
+                'accuracy': results['accuracy'],
+                'correct': results['correct'],
+                'total': results['total'],
+                'model': args.model  # Store model name
             })
 
         except Exception as e:
@@ -339,19 +375,30 @@ def main():
             gc.collect()
 
     # Calculate average accuracy
-    if results:
-        avg_accuracy = sum(r['accuracy'] for r in results) / len(results)
+    if summary_results:
+        avg_accuracy = sum(r['accuracy'] for r in summary_results) / len(summary_results)
+        all_results['average_accuracy'] = avg_accuracy
+
+        # Save results with model name in filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_filename = f"zero_shot_results_{args.model}_{timestamp}.json"
+        results_path = os.path.join(model_save_dir, results_filename)
+
+        with open(results_path, 'w') as f:
+            json.dump(all_results, f, indent=4)
+
+        print(f"\nResults saved to: {results_path}")
 
         # Print summary table
         print("\n=== Zero-shot Results Summary ===")
-        print(f"{'Dataset':<15} {'Accuracy':<10}")
-        print("-" * 25)
+        print(f"{'Dataset':<15} | {'Accuracy':<10} | {'Model':<12}")
+        print("-" * 43)
 
-        for result in sorted(results, key=lambda x: x['dataset']):
-            print(f"{result['dataset']:<15} {result['accuracy'] * 100:.2f}%")
+        for result in sorted(summary_results, key=lambda x: x['dataset']):
+            print(f"{result['dataset']:<15} | {result['accuracy'] * 100:>8.2f}% | {result['model']:<12}")
 
-        print("-" * 25)
-        print(f"{'Average':<15} {avg_accuracy * 100:.2f}%")
+        print("-" * 43)
+        print(f"{'Average':<15} | {avg_accuracy * 100:>8.2f}% | {args.model:<12}")
         print("=" * 50)
 
 

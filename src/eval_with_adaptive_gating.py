@@ -207,12 +207,13 @@ def cleanup_resources(dataset):
     torch.cuda.empty_cache()
 
 
-def find_model_path(model_dir, dataset_name, no_gating=False, no_metanet=False, debug=False):
+def find_model_path(model_dir, dataset_name, model_name, no_gating=False, no_metanet=False, debug=False):
     """Find the model path for a given dataset, supporting different model types
 
     Args:
         model_dir: Directory containing trained models
         dataset_name: Name of the dataset
+        model_name: Name of the model (e.g., ViT-B-32)
         no_gating: Whether to look for a model trained without gating
         no_metanet: Whether to look for a model trained without MetaNet
         debug: Whether to print debug information
@@ -235,8 +236,18 @@ def find_model_path(model_dir, dataset_name, no_gating=False, no_metanet=False, 
     else:
         gating_suffix = "_adaptive_gating"
 
+    # Model-specific directory
+    model_specific_dir = os.path.join(model_dir, model_name)
+
+    # Check if model-specific directory exists
+    if os.path.exists(model_specific_dir):
+        model_dir = model_specific_dir
+        if debug:
+            print(f"Using model-specific directory: {model_dir}")
+
     # Check these paths in order
     possible_paths = [
+        # Model-specific paths
         os.path.join(model_dir, val_name, f"best{gating_suffix}_model.pt"),
         os.path.join(model_dir, val_name, f"best_{gating_suffix.strip('_')}_model.pt"),
         os.path.join(model_dir, base_name, f"best{gating_suffix}_model.pt"),
@@ -250,6 +261,18 @@ def find_model_path(model_dir, dataset_name, no_gating=False, no_metanet=False, 
         os.path.join(model_dir, val_name, f"best_model.pt"),
         os.path.join(model_dir, base_name, f"best_model.pt"),
     ])
+
+    # Also try in top-level directories (for backward compatibility)
+    if model_dir != model_specific_dir:
+        possible_paths.extend([
+            # Top-level directories
+            os.path.join(model_specific_dir, val_name, f"best{gating_suffix}_model.pt"),
+            os.path.join(model_specific_dir, val_name, f"best_{gating_suffix.strip('_')}_model.pt"),
+            os.path.join(model_specific_dir, base_name, f"best{gating_suffix}_model.pt"),
+            os.path.join(model_specific_dir, base_name, f"best_{gating_suffix.strip('_')}_model.pt"),
+            os.path.join(model_specific_dir, val_name, f"best_precomputed_model.pt"),
+            os.path.join(model_specific_dir, base_name, f"best_precomputed_model.pt"),
+        ])
 
     for path in possible_paths:
         if os.path.exists(path):
@@ -275,7 +298,7 @@ def find_model_path(model_dir, dataset_name, no_gating=False, no_metanet=False, 
                 return path
 
     model_type = "Atlas" if no_metanet else "no-gating" if no_gating else "gating"
-    raise FileNotFoundError(f"Could not find {model_type} model for {dataset_name} in {model_dir}")
+    raise FileNotFoundError(f"Could not find {model_type} model for {dataset_name} (model: {model_name}) in {model_dir}")
 
 
 def evaluate_model(model_path, dataset, device, args):
@@ -309,13 +332,14 @@ def evaluate_model(model_path, dataset, device, args):
             print(f"Loading model configuration from checkpoint")
         config = state_dict['config']
         feature_dim = config.get('feature_dim')
+        model_name = config.get('model_name', args.model)  # Get model name from config
 
         # Check for no_metanet flag in config
         no_metanet = config.get('no_metanet', False)
 
         if no_metanet:
             # Atlas model
-            print(f"Detected Atlas model (no MetaNet)")
+            print(f"Detected Atlas model (no MetaNet) for {model_name}")
             if args.debug:
                 print(f"Creating DirectFeatureModel")
         else:
@@ -330,11 +354,11 @@ def evaluate_model(model_path, dataset, device, args):
 
             # Check if the model was trained with no-gating mode
             if no_gating or base_threshold < 1e-6:
-                print(f"Detected model trained without gating mechanism")
+                print(f"Detected model trained without gating mechanism for {model_name}")
                 no_gating = True
             else:
                 # Print configuration for model identification
-                print(f"Model parameters: αT={base_threshold:.4f}, β={beta:.4f}")
+                print(f"Model parameters for {model_name}: αT={base_threshold:.4f}, β={beta:.4f}")
                 print(f"Using {'blockwise' if blockwise else 'global'} coefficients with {num_task_vectors} task vectors")
     else:
         # No config found, use command line arguments and analyze model
@@ -348,6 +372,7 @@ def evaluate_model(model_path, dataset, device, args):
         else:
             features = batch[0]
         feature_dim = features.shape[1]
+        model_name = args.model  # Default to model name from args
 
         # Use provided arguments for model type
         no_metanet = args.no_metanet
@@ -363,11 +388,11 @@ def evaluate_model(model_path, dataset, device, args):
 
             # Print inferred parameters
             if args.no_gating:
-                print(f"Using model without gating mechanism")
+                print(f"Using model without gating mechanism for {model_name}")
             else:
-                print(f"Using default parameters: αT={base_threshold:.4f}, β={beta:.4f}")
+                print(f"Using default parameters for {model_name}: αT={base_threshold:.4f}, β={beta:.4f}")
         else:
-            print(f"Using Atlas implementation (direct features)")
+            print(f"Using Atlas implementation (direct features) for {model_name}")
 
     # Create the appropriate model based on detected or specified type
     try:
@@ -459,6 +484,7 @@ def evaluate_model(model_path, dataset, device, args):
     # Get model type information for reporting
     model_info = {
         'no_metanet': no_metanet if 'no_metanet' in locals() else args.no_metanet,
+        'model_name': model_name,  # Keep track of model name
     }
 
     if not model_info['no_metanet']:
@@ -645,6 +671,7 @@ def evaluate_model(model_path, dataset, device, args):
         'config': {
             'feature_dim': feature_dim,
             'no_metanet': model_info['no_metanet'],
+            'model_name': model_info['model_name'],  # Include model name in results
         },
         'model_path': model_path,
         'model_type': model_type,
@@ -693,10 +720,16 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Setup directories with simplified logic
-    save_dir = os.path.join(args.save_dir, "evaluation_results")
-    os.makedirs(save_dir, exist_ok=True)
-    print(f"Results will be saved to: {save_dir}")
+    # Create model-specific save directory for results
+    model_save_dir = os.path.join(args.save_dir, args.model, "evaluation_results")
+    os.makedirs(model_save_dir, exist_ok=True)
+    print(f"Results will be saved to: {model_save_dir}")
+
+    # Create model-specific model directory if it exists
+    model_specific_dir = os.path.join(args.model_dir, args.model)
+    if os.path.exists(model_specific_dir):
+        args.model_dir = model_specific_dir
+        print(f"Using model-specific directory for models: {args.model_dir}")
 
     # Generate descriptive suffix for results
     if args.no_metanet:
@@ -759,6 +792,7 @@ def main():
                 model_path = find_model_path(
                     args.model_dir,
                     dataset_name,
+                    args.model,  # Pass model name to find_model_path
                     no_gating=args.no_gating,
                     no_metanet=args.no_metanet,
                     debug=args.debug
@@ -778,6 +812,7 @@ def main():
             )
 
             # Print results
+            print(f"Model: {results['config']['model_name']}")
             print(f"Accuracy: {results['accuracy'] * 100:.2f}% ({results['num_correct']}/{results['num_samples']})")
 
             # Print model-specific information
@@ -824,6 +859,7 @@ def main():
                 'accuracy': results['accuracy'],
                 'samples': results['num_samples'],
                 'no_metanet': results['config']['no_metanet'],
+                'model_name': results['config']['model_name'],  # Include model name
             }
 
             # Add MetaNet specific information if applicable
@@ -854,10 +890,10 @@ def main():
         all_results['average_accuracy'] = avg_accuracy
         print(f"\nAverage accuracy across all datasets: {avg_accuracy * 100:.2f}%")
 
-    # Save all results
+    # Save all results with model name included in filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results_path = os.path.join(
-        save_dir,
+        model_save_dir,
         f"evaluation_{args.model}{config_suffix}_{timestamp}.json"
     )
 
@@ -875,7 +911,7 @@ def main():
     else:
         model_type_str = "Adaptive Gating MetaNet"
 
-    print(f"Summary of {model_type_str} Models")
+    print(f"Summary of {args.model} - {model_type_str} Models")
     print("-" * 80)
 
     # Group summary results by model type
@@ -886,50 +922,53 @@ def main():
     # Print Atlas results
     if atlas_results:
         print("\nAtlas (No MetaNet) Results:")
-        print(f"{'Dataset':<15} | {'Accuracy':^10} | {'Model Type':^25}")
-        print("-" * 58)
+        print(f"{'Dataset':<15} | {'Accuracy':^10} | {'Model':^12} | {'Model Type':^25}")
+        print("-" * 68)
 
         for result in sorted(atlas_results, key=lambda x: x['dataset']):
             # Format fields with precise spacing and alignment
             dataset_field = f"{result['dataset']:<15}"
             accuracy_field = f"{result['accuracy']*100:>8.2f}%"
+            model_name_field = f"{result['model_name']:<12}"
             model_type_field = f"{result['model_type']:<25}"
 
             # Print with strict alignment using separators
-            print(f"{dataset_field} | {accuracy_field:^10} | {model_type_field:^25}")
+            print(f"{dataset_field} | {accuracy_field:^10} | {model_name_field:^12} | {model_type_field:^25}")
 
     # Print MetaNet without gating results
     if metanet_no_gating_results:
         print("\nMetaNet (No Gating) Results:")
-        print(f"{'Dataset':<15} | {'Accuracy':^10} | {'Model Type':^25}")
-        print("-" * 58)
+        print(f"{'Dataset':<15} | {'Accuracy':^10} | {'Model':^12} | {'Model Type':^25}")
+        print("-" * 68)
 
         for result in sorted(metanet_no_gating_results, key=lambda x: x['dataset']):
             # Format fields with precise spacing and alignment
             dataset_field = f"{result['dataset']:<15}"
             accuracy_field = f"{result['accuracy']*100:>8.2f}%"
+            model_name_field = f"{result['model_name']:<12}"
             model_type_field = f"{result['model_type']:<25}"
 
             # Print with strict alignment using separators
-            print(f"{dataset_field} | {accuracy_field:^10} | {model_type_field:^25}")
+            print(f"{dataset_field} | {accuracy_field:^10} | {model_name_field:^12} | {model_type_field:^25}")
 
     # Print Adaptive Gating results
     if adaptive_gating_results:
         print("\nAdaptive Gating MetaNet Results:")
-        print(f"{'Dataset':<15} | {'Accuracy':^10} | {'αT':^8} | {'β':^8} | {'Gating %':^10} | {'Model Type':^25}")
-        print("-" * 85)
+        print(f"{'Dataset':<15} | {'Accuracy':^10} | {'Model':^10} | {'αT':^8} | {'β':^8} | {'Gating %':^10} | {'Model Type':^25}")
+        print("-" * 95)
 
         for result in sorted(adaptive_gating_results, key=lambda x: x['dataset']):
             # Format fields with precise spacing and alignment
             dataset_field = f"{result['dataset']:<15}"
             accuracy_field = f"{result['accuracy']*100:>8.2f}%"
+            model_name_field = f"{result['model_name']:<10}"
             alpha_field = f"{result['alpha']:>7.4f}"
             beta_field = f"{result['beta']:>7.4f}"
             gating_field = f"{result.get('gating_ratio', 0)*100:>8.2f}%" if 'gating_ratio' in result else "   N/A   "
             model_type_field = f"{result['model_type']:<25}"
 
             # Print with strict alignment using separators
-            print(f"{dataset_field} | {accuracy_field:^10} | {alpha_field:^8} | {beta_field:^8} | {gating_field:^10} | {model_type_field:^25}")
+            print(f"{dataset_field} | {accuracy_field:^10} | {model_name_field:^10} | {alpha_field:^8} | {beta_field:^8} | {gating_field:^10} | {model_type_field:^25}")
 
     print("=" * 80)
 

@@ -357,7 +357,7 @@ def evaluate_model(model, classifier, dataset, device):
     return correct / total
 
 
-def plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir, no_gating=False, no_metanet=False):
+def plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir, model_name="Unknown", no_gating=False, no_metanet=False):
     """Plot and save training metrics (loss curves)"""
     # Create figure for loss plots
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
@@ -368,11 +368,11 @@ def plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir, no_g
 
     # Adjust title based on mode
     if no_metanet:
-        mode_str = "Atlas (No MetaNet)"
+        mode_str = f"{model_name} - Atlas (No MetaNet)"
     elif no_gating:
-        mode_str = "MetaNet Only (No Gating)"
+        mode_str = f"{model_name} - MetaNet Only (No Gating)"
     else:
-        mode_str = "Adaptive Gating MetaNet"
+        mode_str = f"{model_name} - Adaptive Gating MetaNet"
 
     ax1.set_title(f'Training Loss for {dataset_name} - {mode_str}', fontsize=16)
     ax1.grid(True, alpha=0.7)
@@ -383,11 +383,11 @@ def plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir, no_g
     ax2.set_ylabel('Regularization Loss', fontsize=14)
 
     if no_metanet:
-        ax2.set_title(f'Regularization Loss for {dataset_name} - Atlas (expected to be zero)', fontsize=16)
+        ax2.set_title(f'Regularization Loss for {dataset_name} - {model_name} Atlas (expected to be zero)', fontsize=16)
     elif no_gating:
-        ax2.set_title(f'Regularization Loss for {dataset_name} - No Gating (expected to be zero)', fontsize=16)
+        ax2.set_title(f'Regularization Loss for {dataset_name} - {model_name} No Gating (expected to be zero)', fontsize=16)
     else:
-        ax2.set_title(f'Uncertainty Regularization Loss for {dataset_name}', fontsize=16)
+        ax2.set_title(f'Uncertainty Regularization Loss for {dataset_name} - {model_name}', fontsize=16)
 
     ax2.grid(True, alpha=0.7)
 
@@ -407,7 +407,7 @@ def plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir, no_g
 
 def plot_validation_metrics(val_accuracies, base_threshold_values, beta_values,
                            log_base_threshold_values, log_beta_values,
-                           dataset_name, plot_dir, no_gating=False, no_metanet=False):
+                           dataset_name, plot_dir, model_name="Unknown", no_gating=False, no_metanet=False):
     """Plot and save validation metrics and parameter evolution"""
     # Create figure for accuracy plot
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -420,11 +420,11 @@ def plot_validation_metrics(val_accuracies, base_threshold_values, beta_values,
 
     # Adjust title based on mode
     if no_metanet:
-        mode_str = "Atlas (No MetaNet)"
+        mode_str = f"{model_name} - Atlas (No MetaNet)"
     elif no_gating:
-        mode_str = "MetaNet Only (No Gating)"
+        mode_str = f"{model_name} - MetaNet Only (No Gating)"
     else:
-        mode_str = "Adaptive Gating MetaNet"
+        mode_str = f"{model_name} - Adaptive Gating MetaNet"
 
     ax.set_title(f'Validation Accuracy for {dataset_name} - {mode_str}', fontsize=16)
     ax.grid(True, alpha=0.7)
@@ -462,7 +462,7 @@ def plot_validation_metrics(val_accuracies, base_threshold_values, beta_values,
     ax1.plot(epochs_range, base_threshold_values, 'r-o', linewidth=2, markersize=8, label='αT')
     ax1.plot(epochs_range, beta_values, 'g-o', linewidth=2, markersize=8, label='β')
     ax1.set_ylabel('Parameter Value', fontsize=14)
-    ax1.set_title(f'Gating Parameters Evolution for {dataset_name}', fontsize=16)
+    ax1.set_title(f'Gating Parameters Evolution for {dataset_name} - {model_name}', fontsize=16)
     ax1.legend(fontsize=12)
     ax1.grid(True, alpha=0.7)
 
@@ -484,7 +484,7 @@ def plot_validation_metrics(val_accuracies, base_threshold_values, beta_values,
     ax2.plot(epochs_range, log_beta_values, 'g--o', linewidth=2, markersize=8, label='log(β)')
     ax2.set_xlabel('Epochs', fontsize=14)
     ax2.set_ylabel('Log Parameter Value', fontsize=14)
-    ax2.set_title(f'Log Gating Parameters Evolution for {dataset_name}', fontsize=16)
+    ax2.set_title(f'Log Gating Parameters Evolution for {dataset_name} - {model_name}', fontsize=16)
     ax2.legend(fontsize=12)
     ax2.grid(True, alpha=0.7)
 
@@ -530,8 +530,13 @@ def train_with_adaptive_gating(rank, args):
         "Cars", "DTD", "EuroSAT", "GTSRB", "MNIST", "RESISC45", "SUN397", "SVHN"
     ]
 
+    # Create model-specific directory path
+    model_save_dir = os.path.join(args.save_dir, args.model)
+
     # Ensure save directory exists
-    os.makedirs(args.save_dir, exist_ok=True)
+    os.makedirs(model_save_dir, exist_ok=True)
+    if is_main_process():
+        print(f"Using model-specific save directory: {model_save_dir}")
 
     # Print configuration (main process only)
     if rank == 0:
@@ -551,7 +556,7 @@ def train_with_adaptive_gating(rank, args):
         print(f"Batch size: {args.batch_size}")
         print(f"Learning rate: {args.lr}")
         print(f"Epochs: {args.epochs}")
-        print(f"Save directory: {args.save_dir}")
+        print(f"Save directory: {model_save_dir}")
         print(f"Datasets: {datasets_to_process}")
         print("=" * 30)
 
@@ -564,8 +569,8 @@ def train_with_adaptive_gating(rank, args):
             else:
                 print(f"=== Training on {dataset_name} with adaptive gating ===")
 
-        # Setup save directory for this dataset
-        save_dir = os.path.join(args.save_dir, dataset_name + "Val")
+        # Setup save directory for this dataset (include model name in path)
+        save_dir = os.path.join(model_save_dir, dataset_name + "Val")
         if is_main_process():
             os.makedirs(save_dir, exist_ok=True)
 
@@ -951,18 +956,20 @@ def train_with_adaptive_gating(rank, args):
 
                     json.dump(history, f, indent=4)
 
-                # Create plots directory
-                plot_dir = os.path.join(args.save_dir, "training_plots")
+                # Create plots directory within the model directory
+                plot_dir = os.path.join(model_save_dir, "training_plots")
                 os.makedirs(plot_dir, exist_ok=True)
 
-                # Create plots for loss curves and validation metrics
+                # Create plots for loss curves and validation metrics - include model name
                 plot_training_metrics(train_losses, reg_losses, dataset_name, plot_dir,
+                                     model_name=args.model,
                                      no_gating=args.no_gating, no_metanet=args.no_metanet)
 
                 plot_validation_metrics(
                     val_accuracies, base_threshold_values, beta_values,
                     log_base_threshold_values, log_beta_values,
                     dataset_name, plot_dir,
+                    model_name=args.model,
                     no_gating=args.no_gating, no_metanet=args.no_metanet
                 )
 

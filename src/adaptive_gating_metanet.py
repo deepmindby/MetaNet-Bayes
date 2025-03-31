@@ -388,12 +388,13 @@ class AdaptiveGatingMetaNet(nn.Module):
         # Compute soft margin loss (either well above threshold or well below)
         avg_threshold = self.base_threshold.item()
         margin_width = avg_threshold * 0.2  # 20% of threshold as margin width
+        # margin_width = avg_threshold * 1.0
 
         # Count coefficients within the margin
         in_margin = ((flat_coeffs.abs() > (avg_threshold - margin_width)) &
                     (flat_coeffs.abs() < (avg_threshold + margin_width))).float()
 
-        margin_loss = in_margin.sum() * 0.001  # Small weight
+        margin_loss = in_margin.sum() * 0.0001  # Small weight
 
         # Add parameter regularization to encourage exploration
         init_beta = self.initial_beta.item()
@@ -404,8 +405,8 @@ class AdaptiveGatingMetaNet(nn.Module):
         threshold_dist = torch.abs(self.base_threshold - init_threshold)
 
         # Encourage parameters to move away from initialization
-        beta_reg = -torch.log(beta_dist.clamp(min=1e-5)) * 0.01
-        threshold_reg = -torch.log(threshold_dist.clamp(min=1e-5)) * 0.01
+        beta_reg = -torch.log(beta_dist.clamp(min=1e-5)) * 0.001
+        threshold_reg = -torch.log(threshold_dist.clamp(min=1e-5)) * 0.001
 
         # Combine all losses
         # total_loss = uncertainty_loss + margin_loss + beta_reg + threshold_reg
