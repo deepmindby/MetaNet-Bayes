@@ -8,7 +8,7 @@
 SAVE_DIR="/home/haichao/zby/MetaNet-Bayes/precomputed_features"
 DATA_LOCATION="/home/haichao/zby/MetaNet-Bayes/data"
 MODEL="ViT-L-14"
-BATCH_SIZE=64  # 通用批次大小
+BATCH_SIZE=128  # 通用批次大小
 TIME_LIMITS=36000
 NUM_AUGMENTATIONS=10  # 每个数据集创建的增强版本数量
 
