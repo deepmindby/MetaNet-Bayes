@@ -176,6 +176,30 @@ def parse_arguments():
         choices=["standard", "linear"],
         help="Model finetuning mode: 'standard' or 'linear'",
     )
+    parser.add_argument(
+        "--lr-multiplier",
+        type=float,
+        default=50.0,
+        help="Learning rate multiplier for gating parameters"
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.0005,
+        help="Weight decay for gating parameters"
+    )
+    parser.add_argument(
+        "--reg-coefficient",
+        type=float,
+        default=0.001,
+        help="Regularization coefficient for beta and threshold"
+    )
+    parser.add_argument(
+        "--margin-weight",
+        type=float,
+        default=0.0001,
+        help="Weight for margin loss"
+    )
 
     parsed_args = parser.parse_args()
     parsed_args.device = "cuda" if torch.cuda.is_available() else "cpu"

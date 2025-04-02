@@ -99,6 +99,9 @@ class AdaptiveGatingMetaNet(nn.Module):
         self.register_buffer('initial_base_threshold', torch.tensor([base_threshold], dtype=torch.float))
         self.register_buffer('initial_beta', torch.tensor([beta], dtype=torch.float))
 
+        self.reg_coefficient = args.reg_coefficient if hasattr(args, 'reg_coefficient') else 0.001
+        self.margin_weight = args.margin_weight if hasattr(args, 'margin_weight') else 0.0001
+
         # Handle both list and integer input for task_vectors
         if isinstance(task_vectors, int):
             self.num_task_vectors = task_vectors
@@ -358,6 +361,9 @@ class AdaptiveGatingMetaNet(nn.Module):
         """
         self._reg_loss_count += 1
 
+        if self.uncertainty_reg < 1e-8:
+            return torch.tensor(0.0, device=self.log_base_threshold.device)
+
         # Check if we have the necessary stored values from forward pass
         if (self.last_uncertainties is None or
             self.last_gated_coeffs is None or
@@ -394,7 +400,7 @@ class AdaptiveGatingMetaNet(nn.Module):
         in_margin = ((flat_coeffs.abs() > (avg_threshold - margin_width)) &
                     (flat_coeffs.abs() < (avg_threshold + margin_width))).float()
 
-        margin_loss = in_margin.sum() * 0.0001  # Small weight
+        margin_loss = in_margin.sum() * self.margin_weight  # Small weight
 
         # Add parameter regularization to encourage exploration
         init_beta = self.initial_beta.item()
@@ -405,8 +411,8 @@ class AdaptiveGatingMetaNet(nn.Module):
         threshold_dist = torch.abs(self.base_threshold - init_threshold)
 
         # Encourage parameters to move away from initialization
-        beta_reg = -torch.log(beta_dist.clamp(min=1e-5)) * 0.001
-        threshold_reg = -torch.log(threshold_dist.clamp(min=1e-5)) * 0.001
+        beta_reg = -torch.log(beta_dist.clamp(min=1e-5)) * self.reg_coefficient
+        threshold_reg = -torch.log(threshold_dist.clamp(min=1e-5)) * self.reg_coefficient
 
         # Combine all losses
         # total_loss = uncertainty_loss + margin_loss + beta_reg + threshold_reg
@@ -417,7 +423,7 @@ class AdaptiveGatingMetaNet(nn.Module):
         # param_reg = self.log_base_threshold.abs() * 0.0001 + self.log_beta.abs() * 0.0001
         # param_reg = 0
 
-        return total_loss + 1e-6
+        return total_loss
 
     def get_gating_stats(self):
         """Get statistics about the gating process for monitoring

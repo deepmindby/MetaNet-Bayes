@@ -674,13 +674,13 @@ def train_with_adaptive_gating(rank, args):
                 # For no-gating, we mainly care about meta_net parameters
                 param_groups = [
                     {'params': meta_net_params, 'lr': args.lr * 3, 'weight_decay': 0.001},  # Higher LR
-                    {'params': gating_log_params, 'lr': args.lr * 0.01, 'weight_decay': 0.0},  # Very low LR
+                    {'params': gating_log_params, 'lr': args.lr * 0.0001, 'weight_decay': 0.0},  # Very low LR
                     {'params': other_params, 'lr': args.lr, 'weight_decay': args.wd}
                 ]
             else:
                 param_groups = [
-                    {'params': gating_log_params, 'lr': args.lr * 50, 'weight_decay': 0.0001},  # Higher LR for gating
-                    {'params': meta_net_params, 'lr': args.lr * 2, 'weight_decay': 0.001},       # Higher LR for meta_net
+                    {'params': gating_log_params, 'lr': args.lr * args.lr_multiplier, 'weight_decay': args.weight_decay},  # Higher LR for gating
+                    {'params': meta_net_params, 'lr': args.lr * 3, 'weight_decay': 0.001},       # Higher LR for meta_net
                     {'params': other_params, 'lr': args.lr, 'weight_decay': args.wd}
                 ]
 
