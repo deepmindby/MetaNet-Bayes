@@ -615,7 +615,9 @@ def train_with_adaptive_gating(rank, args):
                     blockwise=args.blockwise_coef,
                     base_threshold=args.base_threshold,
                     beta=args.beta,
-                    uncertainty_reg=args.uncertainty_reg
+                    uncertainty_reg=args.uncertainty_reg,
+                    reg_coefficient=args.reg_coefficient if hasattr(args, 'reg_coefficient') else 0.001,
+                    margin_weight=args.margin_weight if hasattr(args, 'margin_weight') else 0.0001
                 )
                 if is_main_process():
                     model_type = "with adaptive gating" if not args.no_gating else "without gating"
