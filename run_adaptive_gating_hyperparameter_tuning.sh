@@ -4,11 +4,11 @@
 # 直接在8张GPU上平均分配任务，不进行复杂的GPU检查
 
 # 基础设置
-MODEL="ViT-B-32"  # 可选: ViT-B-32, RN50, RN101 等
+MODEL="ViT-B-16"  # 可选: ViT-B-32, RN50, RN101 等
 SAVE_DIR="/home/haichao/zby/MetaNet-Bayes/checkpoints_hyperparameter_tuning"
 DATA_LOCATION="~/zby/MetaNet-Bayes"
-BATCH_SIZE=128
-EPOCHS=10  # 减少训练轮数加快实验
+BATCH_SIZE=64
+EPOCHS=10
 NUM_WORKERS=4
 NUM_TASK_VECTORS=8
 SEED=42
@@ -24,15 +24,29 @@ RESULTS_FILE="${LOG_DIR}/tuning_results.csv"
 mkdir -p "$LOG_DIR"
 
 # 初始化结果CSV文件
-echo "dataset,base_threshold,beta,uncertainty_reg,blockwise,no_gating,no_metanet,accuracy,model,gpu_id,time_minutes" > "$RESULTS_FILE"
+echo "dataset,base_threshold,beta,uncertainty_reg,blockwise,no_gating,no_metanet,train_accuracy,model,gpu_id,time_minutes" > "$RESULTS_FILE"
 
 # 要测试的数据集
-DATASETS=("DTD")  # 根据需要调整
+DATASETS=("MNIST")
+#DATASETS=("MNIST" "RESISC45" "SUN397" "SVHN")
+#DATASETS=("Cars" "DTD" "EuroSAT" "GTSRB" "MNIST" "RESISC45" "SUN397" "SVHN")
 
 # 超参数搜索空间
-BASE_THRESHOLDS=(0.1)
-BETAS=(1.0 2.0)
-UNCERTAINTY_REGS=(0.05, 0.01)
+BASE_THRESHOLDS=(0.01 0.03 0.05 0.06 0.07)
+BETAS=(0.8 1.0 1.2)
+UNCERTAINTY_REGS=(0.008 0.01 0.015 0.02)
+LR_MULTIPLIERS=(20.0 30.0 40.0 50.0 60.0 70.0 100.0)
+WEIGHT_DECAYS=(0.0005)
+REG_COEFFICIENTS=(0.0008 0.001 0.0012 0.002)
+MARGIN_WEIGHTS=(0.00005 0.0001 0.0002 0.0005 0.0006)
+#BASE_THRESHOLDS=(0.05)
+#BETAS=(1.0)
+#UNCERTAINTY_REGS=(0.01)
+#LR_MULTIPLIERS=(50.0)
+#WEIGHT_DECAYS=(0.0005)
+#REG_COEFFICIENTS=(0.0008 0.001)
+#MARGIN_WEIGHTS=(0.0001)
+
 
 # 设置实验标题
 echo "========================================"
@@ -125,23 +139,23 @@ run_experiment() {
         end_time=$(date +%s)
         duration_minutes=$(( (end_time - start_time) / 60 ))
 
-        # 提取准确率结果
-        local accuracy=$(grep -oP "Best validation accuracy: \K[0-9.]+(?=%)" "$log_file" | tail -1)
-        if [ -z "$accuracy" ]; then
-            # 尝试其他可能的格式
-            accuracy=$(grep -oP "最佳验证准确率: \K[0-9.]+(?=%)" "$log_file" | tail -1)
-            if [ -z "$accuracy" ]; then
-                accuracy=$(grep -E "Accuracy: [0-9.]+" "$log_file" | tail -1 | grep -oP "Accuracy: \K[0-9.]+")
-                if [ -z "$accuracy" ]; then
-                    accuracy="N/A"
-                fi
+        # 提取训练精度结果 - 只关注训练精度，不添加评估部分
+        local train_accuracy=$(grep -oP "Epoch \d+/\d+ - Training.*Loss: \K[0-9.]+" "$log_file" | tail -5 | awk '{ sum += $1 } END { if (NR > 0) print 100 - sum/NR; else print "N/A" }')
+        if [ -z "$train_accuracy" ] || [ "$train_accuracy" == "N/A" ]; then
+            # 尝试其他可能的格式 - 寻找最后的训练损失
+            train_loss=$(grep -oP "Task Loss: \K[0-9.]+" "$log_file" | tail -1)
+            if [ -n "$train_loss" ]; then
+                # 简单地将损失转换为估计的精度 (仅用于记录)
+                train_accuracy=$(echo "scale=2; 100 - $train_loss * 10" | bc)
+            else
+                train_accuracy="N/A"
             fi
         fi
 
-        # 记录结果到CSV
-        echo "$dataset,$base_threshold,$beta,$uncertainty_reg,$blockwise,$no_gating,$no_metanet,$accuracy,$MODEL,$gpu_id,$duration_minutes" >> "$RESULTS_FILE"
+        # 记录结果到CSV - 只记录训练指标
+        echo "$dataset,$base_threshold,$beta,$uncertainty_reg,$blockwise,$no_gating,$no_metanet,$train_accuracy,$MODEL,$gpu_id,$duration_minutes" >> "$RESULTS_FILE"
 
-        echo -e "\n完成实验: $exp_name, 准确率: $accuracy% (GPU $gpu_id), 耗时: ${duration_minutes}分钟"
+        echo -e "\n完成实验: $exp_name, 训练指标: $train_accuracy (GPU $gpu_id), 耗时: ${duration_minutes}分钟"
     ) &
 
     # 返回进程PID以便可能的跟踪
@@ -202,6 +216,15 @@ for dataset in "${DATASETS[@]}"; do
     done
 done
 
+# 实验4: 比较不同的uncertainty_reg
+for dataset in "${DATASETS[@]}"; do
+    for uncertainty_reg in "${UNCERTAINTY_REGS[@]}"; do
+        if [ "$uncertainty_reg" != "0.01" ]; then  # 避免重复
+            add_experiment_task "$dataset" 0.05 1.0 $uncertainty_reg true false false
+        fi
+    done
+done
+
 # 显示实验总数
 TOTAL_EXPERIMENTS=${#EXPERIMENT_TASKS[@]}
 echo "总共 $TOTAL_EXPERIMENTS 个实验任务将被执行"
@@ -231,7 +254,7 @@ for i in $(seq 0 $((TOTAL_EXPERIMENTS-1))); do
     # 启动实验
     run_experiment "$dataset" "$base_threshold" "$beta" "$uncertainty_reg" "$blockwise" "$no_gating" "$no_metanet" "$gpu_id" "$i"
 
-    # 更新进度
+    # 简单进度显示
     COMPLETED_TASKS=$((i+1))
     show_progress $COMPLETED_TASKS $TOTAL_EXPERIMENTS
 
@@ -254,33 +277,33 @@ from datetime import datetime
 
 # 读取结果
 results = pd.read_csv('$RESULTS_FILE')
-results['accuracy'] = pd.to_numeric(results['accuracy'], errors='coerce')
+results['train_accuracy'] = pd.to_numeric(results['train_accuracy'], errors='coerce')
 
 # 创建摘要文件
-with open('${LOG_DIR}/summary.txt', 'w') as f:
-    f.write(f'多GPU超参数调优实验摘要 - {datetime.now().strftime(\"%Y-%m-%d %H:%M\")}\\n')
+with open('${LOG_DIR}/training_summary.txt', 'w') as f:
+    f.write(f'多GPU超参数调优训练摘要 - {datetime.now().strftime(\"%Y-%m-%d %H:%M\")}\\n')
     f.write('======================\\n\\n')
 
     # 实验概况
-    f.write('实验概况:\\n')
+    f.write('训练概况:\\n')
     f.write(f'总实验数: {len(results)}\\n')
-    f.write(f'已完成实验数: {len(results[results[\"accuracy\"] != \"N/A\"])}\\n')
-    if results['accuracy'].notna().any():
-        f.write(f'平均准确率: {results[\"accuracy\"].mean():.2f}%\\n')
+    f.write(f'已完成实验数: {len(results[results[\"train_accuracy\"] != \"N/A\"])}\\n')
+    if results['train_accuracy'].notna().any():
+        f.write(f'平均训练指标: {results[\"train_accuracy\"].mean():.2f}\\n')
 
     # 每个数据集的最佳参数
-    f.write('\\n\\n每个数据集的最佳参数:\\n')
+    f.write('\\n\\n每个数据集的最佳训练参数:\\n')
     for dataset in results['dataset'].unique():
         dataset_results = results[results['dataset'] == dataset]
-        if dataset_results['accuracy'].notna().any():
-            best_row = dataset_results.loc[dataset_results['accuracy'].idxmax()]
+        if dataset_results['train_accuracy'].notna().any():
+            best_row = dataset_results.loc[dataset_results['train_accuracy'].idxmax()]
             f.write(f'\\n{dataset}:\\n')
-            f.write(f'  最佳准确率: {best_row[\"accuracy\"]}%\\n')
+            f.write(f'  最佳训练指标: {best_row[\"train_accuracy\"]}\\n')
             f.write(f'  参数: base_threshold={best_row[\"base_threshold\"]}, beta={best_row[\"beta\"]}, uncertainty_reg={best_row[\"uncertainty_reg\"]}\\n')
             f.write(f'  blockwise={best_row[\"blockwise\"]}, no_gating={best_row[\"no_gating\"]}, no_metanet={best_row[\"no_metanet\"]}\\n')
 
     # 各方法的比较
-    f.write('\\n\\n不同方法的比较:\\n')
+    f.write('\\n\\n不同方法的训练指标比较:\\n')
     methods = []
     if (results['no_metanet'] == False).any() and (results['no_gating'] == False).any():
         methods.append(('MetaNet with Gating', (results['no_metanet'] == False) & (results['no_gating'] == False)))
@@ -291,72 +314,23 @@ with open('${LOG_DIR}/summary.txt', 'w') as f:
 
     for method_name, mask in methods:
         method_results = results[mask]
-        if not method_results.empty and method_results['accuracy'].notna().any():
-            avg_acc = method_results['accuracy'].mean()
+        if not method_results.empty and method_results['train_accuracy'].notna().any():
+            avg_acc = method_results['train_accuracy'].mean()
             f.write(f'\\n{method_name}:\\n')
-            f.write(f'  平均准确率: {avg_acc:.2f}%\\n')
+            f.write(f'  平均训练指标: {avg_acc:.2f}\\n')
 
             # 每个数据集的结果
             for dataset in method_results['dataset'].unique():
                 dataset_method = method_results[method_results['dataset'] == dataset]
-                if not dataset_method.empty and dataset_method['accuracy'].notna().any():
-                    best_acc = dataset_method['accuracy'].max()
-                    f.write(f'  {dataset}: {best_acc:.2f}%\\n')
+                if not dataset_method.empty and dataset_method['train_accuracy'].notna().any():
+                    best_acc = dataset_method['train_accuracy'].max()
+                    f.write(f'  {dataset}: {best_acc:.2f}\\n')
 
-    # 参数敏感性分析
-    f.write('\\n\\n参数敏感性分析:\\n')
-
-    # 仅分析带门控的MetaNet
-    metanet_results = results[(results['no_metanet'] == False) & (results['no_gating'] == False)]
-
-    if not metanet_results.empty and metanet_results['accuracy'].notna().any():
-        # Base threshold影响
-        f.write('\\nBase Threshold影响:\\n')
-        for bt in sorted(metanet_results['base_threshold'].unique()):
-            bt_results = metanet_results[metanet_results['base_threshold'] == bt]
-            if not bt_results.empty and bt_results['accuracy'].notna().any():
-                bt_avg = bt_results['accuracy'].mean()
-                f.write(f'  {bt}: {bt_avg:.2f}%\\n')
-
-        # Beta影响
-        f.write('\\nBeta影响:\\n')
-        for beta in sorted(metanet_results['beta'].unique()):
-            beta_results = metanet_results[metanet_results['beta'] == beta]
-            if not beta_results.empty and beta_results['accuracy'].notna().any():
-                beta_avg = beta_results['accuracy'].mean()
-                f.write(f'  {beta}: {beta_avg:.2f}%\\n')
-
-        # Uncertainty reg影响
-        f.write('\\nUncertainty Regularization影响:\\n')
-        for ur in sorted(metanet_results['uncertainty_reg'].unique()):
-            ur_results = metanet_results[metanet_results['uncertainty_reg'] == ur]
-            if not ur_results.empty and ur_results['accuracy'].notna().any():
-                ur_avg = ur_results['accuracy'].mean()
-                f.write(f'  {ur}: {ur_avg:.2f}%\\n')
-
-    # 添加GPU使用统计
-    f.write('\\n\\nGPU使用统计:\\n')
-    gpu_stats = results.groupby('gpu_id').agg({
-        'accuracy': ['count', 'mean'],
-        'time_minutes': ['mean', 'sum']
-    }).fillna(0)
-
-    if not gpu_stats.empty:
-        for gpu_id, stats in gpu_stats.iterrows():
-            if gpu_id >= 0 and gpu_id < $GPU_COUNT:  # 确保GPU ID有效
-                count = int(stats[('accuracy', 'count')])
-                if count > 0:  # 只显示有实验的GPU
-                    mean_acc = stats[('accuracy', 'mean')]
-                    mean_time = stats[('time_minutes', 'mean')]
-                    total_time = stats[('time_minutes', 'sum')]
-                    f.write(f'  GPU {gpu_id}: 运行了 {count} 个实验, 平均准确率: {mean_acc:.2f}%, ')
-                    f.write(f'平均每个实验 {mean_time:.1f} 分钟, 总时间 {total_time:.1f} 分钟\\n')
+    f.write('\\n注意: 此摘要仅包含训练指标，不包含评估结果。请使用evaluate_model.sh脚本进行正式评估。\\n')
 "
 
-echo "实验完成！结果保存在: $RESULTS_FILE"
-echo "摘要报告: ${LOG_DIR}/summary.txt"
+echo "训练实验完成！结果保存在: $RESULTS_FILE"
+echo "训练摘要报告: ${LOG_DIR}/training_summary.txt"
 
-# 可选: 通知实验完成
-HOSTNAME=$(hostname)
-echo -e "\\a"  # 发出哔声提醒
-echo "实验已在 $HOSTNAME 上完成 ($(date))"
+# 提醒用户进行评估
+echo "训练完成后，请使用evaluate_model.sh脚本对最佳模型进行评估。"

@@ -176,29 +176,39 @@ BEST_PARAMS=""
 if [ -f "$CACHE_FILE" ] && [ "$FORCE_REEVALUATE" = false ]; then
     echo "找到缓存的评估结果，读取中..." | tee -a "$LOG_FILE"
 
-    # 使用Python解析JSON缓存
-    python3 -c "
+    # 使用安全方法解析JSON缓存
+    # 修复: 使用标准的JSON解析方法，防止格式错误
+    if python3 -c "
 import json
 import sys
 
 try:
     with open('$CACHE_FILE', 'r') as f:
-        cache = json.load(f)
+        content = f.read()
+        cache = json.loads(content)
+
+    # 确保cache是列表
+    if not isinstance(cache, list):
+        print('缓存文件格式错误，需要JSON数组')
+        sys.exit(1)
 
     # 找到准确率最高的实验
     best_exp = None
     best_acc = 0
 
     for exp in cache:
+        if not isinstance(exp, dict):
+            continue
+
         accuracy = float(exp.get('accuracy', 0))
         if accuracy > best_acc:
             best_acc = accuracy
             best_exp = exp
 
     if best_exp:
-        print(f\"最佳实验: {best_exp['exp_dir']}\\n\"
-              f\"测试准确率: {best_exp['accuracy']}%\\n\"
-              f\"参数: {json.dumps(best_exp['params'])}\\n\")
+        print(f\"最佳实验: {best_exp.get('exp_dir', 'unknown')}\\n\"
+              f\"测试准确率: {best_exp.get('accuracy', 0)}%\\n\"
+              f\"参数: {json.dumps(best_exp.get('params', {}))}\\n\")
     else:
         print('缓存中没有有效的结果')
         sys.exit(1)
@@ -206,10 +216,7 @@ try:
 except Exception as e:
     print(f'读取缓存失败: {e}')
     sys.exit(1)
-" | tee -a "$LOG_FILE"
-
-    # 如果缓存读取成功，使用缓存中的最佳模型
-    if [ $? -eq 0 ]; then
+" >> "$LOG_FILE" 2>&1; then
         # 提取最佳模型信息
         BEST_ACCURACY=$(grep -oP "测试准确率: \K[0-9.]+(?=%)" <<< "$(grep "测试准确率:" "$LOG_FILE" | tail -1)")
         BEST_EXP_DIR=$(grep -oP "最佳实验: \K.*" <<< "$(grep "最佳实验:" "$LOG_FILE" | tail -1)")
@@ -218,6 +225,10 @@ except Exception as e:
         echo "使用缓存中的最佳实验: $BEST_EXP_DIR" | tee -a "$LOG_FILE"
     else
         echo "缓存读取失败或没有有效结果，将进行完整评估" | tee -a "$LOG_FILE"
+        # 确保清除可能的部分读取结果
+        BEST_EXP_DIR=""
+        BEST_ACCURACY=0
+        BEST_PARAMS=""
     fi
 fi
 
@@ -227,6 +238,8 @@ if [ -z "$BEST_EXP_DIR" ]; then
 
     # 创建数组保存所有评估结果
     ALL_RESULTS=()
+    VALID_RESULTS_COUNT=0
+    FAILED_RESULTS_COUNT=0
 
     for exp_dir in "${EXP_DIRS[@]}"; do
         exp_name=$(basename "$exp_dir")
@@ -262,6 +275,7 @@ if [ -z "$BEST_EXP_DIR" ]; then
         eval_cmd="$eval_cmd --base-threshold $bt"
         eval_cmd="$eval_cmd --beta $beta"
         eval_cmd="$eval_cmd --verbose"
+        eval_cmd="$eval_cmd --debug"  # 添加debug标志以获取更多信息
 
         # 添加blockwise参数(如果需要)
         if [ "$blockwise" = "true" ]; then
@@ -279,7 +293,7 @@ if [ -z "$BEST_EXP_DIR" ]; then
         fi
 
         # 记录评估命令
-        # echo "评估命令: $eval_cmd" | tee -a "$LOG_FILE"
+        # echo "评估命令: $eval_cmd" | tee -a "$DEBUG_FILE"
 
         # 执行评估并将输出重定向到临时文件
         exp_log_file="${OUTPUT_DIR}/${exp_name}_eval.log"
@@ -289,34 +303,76 @@ if [ -z "$BEST_EXP_DIR" ]; then
         # 检查评估是否成功
         if [ $? -ne 0 ]; then
             echo "评估失败，查看日志: $exp_log_file" | tee -a "$LOG_FILE"
+            FAILED_RESULTS_COUNT=$((FAILED_RESULTS_COUNT+1))
             continue
         fi
 
-        # 从日志提取准确率
-        accuracy=$(grep -oP "Accuracy: \K[0-9.]+(?=%)" "$exp_log_file" | tail -1)
+        # 改进: 支持多种格式的准确率提取 - 尝试多种模式
+        accuracy=""
 
-        # 如果找不到，尝试其他格式
-        if [ -z "$accuracy" ]; then
+        # 尝试"Accuracy: XX.XX%"格式
+        if grep -q "Accuracy: [0-9.]\+%" "$exp_log_file"; then
+            accuracy=$(grep -oP "Accuracy: \K[0-9.]+(?=%)" "$exp_log_file" | tail -1)
+        fi
+
+        # 尝试"Test accuracy: XX.XX%"格式
+        if [ -z "$accuracy" ] && grep -q "Test accuracy: [0-9.]\+%" "$exp_log_file"; then
             accuracy=$(grep -oP "Test accuracy: \K[0-9.]+(?=%)" "$exp_log_file" | tail -1)
         fi
 
-        if [ -z "$accuracy" ]; then
+        # 尝试"test accuracy: XX.XX"格式
+        if [ -z "$accuracy" ] && grep -q "test accuracy: [0-9.]\+" "$exp_log_file"; then
             accuracy=$(grep -oP "test accuracy: \K[0-9.]+" "$exp_log_file" | tail -1)
         fi
 
+        # 尝试任何包含"accuracy"和数字的行
         if [ -z "$accuracy" ]; then
             accuracy=$(grep -i "accuracy" "$exp_log_file" | grep -oP "[0-9]+\.[0-9]+(?=%)" | tail -1)
         fi
 
+        # 最后检查是否获取到了准确率
         if [ -z "$accuracy" ]; then
-            echo "警告: 未能从评估日志中提取准确率" | tee -a "$LOG_FILE"
+            # 失败时，检查常见错误
+            if grep -q "Could not find" "$exp_log_file"; then
+                error_msg="找不到匹配的模型文件"
+            elif grep -q "out of memory" "$exp_log_file"; then
+                error_msg="GPU内存不足"
+            elif grep -q "RuntimeError" "$exp_log_file"; then
+                error_msg="运行时错误"
+            else
+                error_msg="未知错误，可能是日志格式问题"
+            fi
+
+            echo "警告: 未能从评估日志中提取准确率 - $error_msg" | tee -a "$LOG_FILE"
+            echo "请检查日志文件: $exp_log_file" | tee -a "$LOG_FILE"
+            echo "记录为故障案例" | tee -a "$LOG_FILE"
+            FAILED_RESULTS_COUNT=$((FAILED_RESULTS_COUNT+1))
             accuracy="0.0"
+        else
+            VALID_RESULTS_COUNT=$((VALID_RESULTS_COUNT+1))
+        fi
+
+        # 检查是否有gating ratio信息
+        gating_ratio=""
+        if grep -q "gating ratio" "$exp_log_file"; then
+            gating_ratio=$(grep -oP "gating ratio=\K[0-9.]+(?=\))" "$exp_log_file" | tail -1)
+            if [ -n "$gating_ratio" ]; then
+                # 转换为百分比
+                gating_ratio=$(echo "$gating_ratio * 100" | bc)
+            fi
         fi
 
         echo "测试准确率: $accuracy%" | tee -a "$LOG_FILE"
+        if [ -n "$gating_ratio" ]; then
+            echo "门控比例: $gating_ratio%" | tee -a "$LOG_FILE"
+        fi
 
         # 保存结果
-        result="{\"exp_dir\": \"$exp_dir\", \"accuracy\": $accuracy, \"params\": $params}"
+        result="{\"exp_dir\": \"$exp_dir\", \"accuracy\": $accuracy, \"params\": $params"
+        if [ -n "$gating_ratio" ]; then
+            result="$result, \"gating_ratio\": $gating_ratio"
+        fi
+        result="$result}"
         ALL_RESULTS+=("$result")
 
         # 更新最佳结果
@@ -332,8 +388,51 @@ if [ -z "$BEST_EXP_DIR" ]; then
 
     # 保存所有结果到缓存文件
     if [ ${#ALL_RESULTS[@]} -gt 0 ]; then
-        echo "[${ALL_RESULTS[*]}]" > "$CACHE_FILE"
+        # 确保正确格式化JSON数组
+        echo "[" > "$CACHE_FILE"
+        for i in "${!ALL_RESULTS[@]}"; do
+            echo "${ALL_RESULTS[$i]}" >> "$CACHE_FILE"
+            if [ $i -lt $((${#ALL_RESULTS[@]} - 1)) ]; then
+                echo "," >> "$CACHE_FILE"
+            fi
+        done
+        echo "]" >> "$CACHE_FILE"
+
+        # 验证缓存文件是否为有效JSON
+        if ! python3 -c "import json; json.load(open('$CACHE_FILE'))" &>/dev/null; then
+            echo "警告: 生成的缓存文件不是有效的JSON，尝试修复..." | tee -a "$LOG_FILE"
+            # 简单修复: 重新创建缓存文件
+            echo "[" > "$CACHE_FILE"
+            for i in "${!ALL_RESULTS[@]}"; do
+                # 仅保留有效的JSON对象
+                if python3 -c "import json; json.loads('${ALL_RESULTS[$i]}')" &>/dev/null; then
+                    echo "${ALL_RESULTS[$i]}" >> "$CACHE_FILE"
+                    if [ $i -lt $((${#ALL_RESULTS[@]} - 1)) ]; then
+                        echo "," >> "$CACHE_FILE"
+                    fi
+                fi
+            done
+            echo "]" >> "$CACHE_FILE"
+        fi
+
         echo "评估结果已缓存到: $CACHE_FILE" | tee -a "$LOG_FILE"
+    fi
+
+    # 报告模型评估统计
+    echo "评估统计:" | tee -a "$LOG_FILE"
+    echo "  成功评估: $VALID_RESULTS_COUNT" | tee -a "$LOG_FILE"
+    echo "  评估失败: $FAILED_RESULTS_COUNT" | tee -a "$LOG_FILE"
+    echo "  总实验数: ${#EXP_DIRS[@]}" | tee -a "$LOG_FILE"
+
+    # 分析模型精度为0.0的原因
+    if [ $FAILED_RESULTS_COUNT -gt 0 ]; then
+        echo "为什么有些模型精度为0.0?" | tee -a "$LOG_FILE"
+        echo "可能的原因:" | tee -a "$LOG_FILE"
+        echo "1. 模型文件未正确生成或找不到 - 检查训练是否成功完成" | tee -a "$LOG_FILE"
+        echo "2. 评估命令参数不匹配训练参数 - 确保参数提取正确" | tee -a "$LOG_FILE"
+        echo "3. 评估过程中出现运行时错误 - 查看具体日志文件" | tee -a "$LOG_FILE"
+        echo "4. 无法从日志中提取准确率 - 日志格式可能不一致" | tee -a "$LOG_FILE"
+        echo "建议: 检查各个日志文件以确定具体问题" | tee -a "$LOG_FILE"
     fi
 fi
 
@@ -397,7 +496,14 @@ for key, value in params.items():
     ln -s "$OUTPUT_DIR" "$LATEST_LINK"
     echo "创建了指向最新结果的符号链接: $LATEST_LINK"
 else
-    echo "错误: 未能找到或评估最佳模型" | tee -a "$LOG_FILE"
+    echo "警告: 未能找到或评估最佳模型，请检查日志文件以了解详情" | tee -a "$LOG_FILE"
+    # 尝试提供更多信息来帮助诊断问题
+    if [ -z "$BEST_EXP_DIR" ]; then
+        echo "  原因: 没有找到有效的实验目录" | tee -a "$LOG_FILE"
+    elif [ "$BEST_ACCURACY" = "0.0" ]; then
+        echo "  原因: 所有模型的评估精度都为0.0，请检查评估日志" | tee -a "$LOG_FILE"
+        echo "  建议: 使用 --debug 标志查看更详细的评估输出" | tee -a "$LOG_FILE"
+    fi
     exit 1
 fi
 
