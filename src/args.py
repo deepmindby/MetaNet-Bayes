@@ -200,6 +200,12 @@ def parse_arguments():
         default=0.0001,
         help="Weight for margin loss"
     )
+    parser.add_argument(
+        "--gating-no-metanet",
+        action="store_true",
+        default=False,
+        help="Apply gating mechanism directly to Atlas (no-metanet) model"
+    )
 
     parsed_args = parser.parse_args()
     parsed_args.device = "cuda" if torch.cuda.is_available() else "cpu"

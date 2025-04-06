@@ -403,10 +403,17 @@ def evaluate_model(model_path, dataset, device, args):
                 print("Creating AdaptiveGatingMetaNet instance...")
 
         if no_metanet or args.no_metanet:
-            # Create Atlas model
-            model = DirectFeatureModel(feature_dim=feature_dim)
+            # Create Atlas model with optional gating
+            model = DirectFeatureModel(
+                feature_dim=feature_dim,
+                gating_no_metanet=getattr(args, 'gating_no_metanet', False),
+                base_threshold=args.base_threshold,
+                beta=args.beta,
+                uncertainty_reg=args.uncertainty_reg
+            )
             if args.debug:
-                print(f"Created DirectFeatureModel for Atlas")
+                print(
+                    f"Created DirectFeatureModel for Atlas{' with gating' if getattr(args, 'gating_no_metanet', False) else ''}")
         else:
             # Create MetaNet model
             model = AdaptiveGatingMetaNet(

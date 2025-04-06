@@ -92,7 +92,8 @@ def setup_ddp(rank, world_size, port=12357):
         world_size=world_size,
     )
     torch.cuda.set_device(rank)
-    torch.distributed.barrier()
+    # torch.distributed.barrier()
+    torch.distributed.barrier(device_ids=[rank])
 
 
 def cleanup_ddp():

@@ -16,6 +16,7 @@ from torch.cuda.amp import GradScaler
 import gc
 import traceback
 from datetime import datetime
+import math
 
 from src.adaptive_gating_metanet import AdaptiveGatingMetaNet
 from src.utils import cosine_lr
@@ -30,17 +31,29 @@ class DirectFeatureModel(torch.nn.Module):
     """
     A direct feature model that passes features directly to classifier without MetaNet transformations.
     This implements the Atlas approach using precomputed features.
+    When gating_no_metanet is enabled, it applies gating mechanism directly to features.
     """
-    def __init__(self, feature_dim):
+
+    def __init__(self, feature_dim, gating_no_metanet=False, base_threshold=0.05, beta=1.0, uncertainty_reg=0.01):
         """Initialize DirectFeatureModel
 
         Parameters:
         ----------
         feature_dim: int
             Dimension of the pre-computed feature vectors
+        gating_no_metanet: bool
+            Whether to apply gating mechanism directly to features
+        base_threshold: float
+            Base threshold for gating mechanism (only used if gating_no_metanet is True)
+        beta: float
+            Beta parameter for uncertainty weighting (only used if gating_no_metanet is True)
+        uncertainty_reg: float
+            Weight for uncertainty regularization (only used if gating_no_metanet is True)
         """
         super().__init__()
         self.feature_dim = feature_dim
+        self.gating_no_metanet = gating_no_metanet
+
         # Identity projection (no transformation)
         self.projection = torch.nn.Identity()
 
@@ -55,8 +68,130 @@ class DirectFeatureModel(torch.nn.Module):
         torch.nn.init.zeros_(self.dummy_linear.weight)
         torch.nn.init.zeros_(self.dummy_linear.bias)
 
+        # Adding gating mechanism if enabled
+        if self.gating_no_metanet:
+            # Initialize learnable gating parameters
+            self.log_base_threshold = torch.nn.Parameter(
+                torch.tensor([math.log(max(base_threshold, 1e-5))], dtype=torch.float)
+            )
+            self.log_beta = torch.nn.Parameter(
+                torch.tensor([math.log(max(beta * 0.95, 1e-5))], dtype=torch.float)
+            )
+
+            # Register buffers for monitoring
+            self.register_buffer('initial_base_threshold', torch.tensor([base_threshold], dtype=torch.float))
+            self.register_buffer('initial_beta', torch.tensor([beta], dtype=torch.float))
+
+            # Uncertainty related variables
+            self.uncertainty_reg = uncertainty_reg
+            self._forward_count = 0
+            self._reg_loss_count = 0
+            self.training_mode = True
+
+            # Storage for computed values during forward pass
+            self.last_uncertainties = None
+            self.last_gated_features = None
+            self.last_thresholds = None
+            self.last_orig_features = None
+
+            # Simple transform to generate feature-specific uncertainty
+            self.uncertainty_net = torch.nn.Sequential(
+                torch.nn.Linear(feature_dim, feature_dim // 4),
+                torch.nn.ReLU(),
+                torch.nn.Linear(feature_dim // 4, feature_dim),
+                torch.nn.Sigmoid()
+            )
+
+    @property
+    def base_threshold(self):
+        """Get the actual base threshold value (always positive)"""
+        if self.gating_no_metanet:
+            return torch.exp(self.log_base_threshold)
+        return torch.tensor(0.0)
+
+    @property
+    def beta(self):
+        """Get the actual beta value (always positive)"""
+        if self.gating_no_metanet:
+            return torch.exp(self.log_beta)
+        return torch.tensor(0.0)
+
+    def compute_uncertainty(self, features):
+        """Compute uncertainty based on feature characteristics
+
+        Parameters:
+        ----------
+        features: Tensor [batch_size, feature_dim]
+            Input features
+
+        Returns:
+        ----------
+        uncertainties: Tensor [batch_size, feature_dim]
+            Uncertainty scores for each feature dimension
+        """
+        batch_size = features.size(0)
+
+        # Get feature-specific uncertainty using the network
+        feature_uncertainty = self.uncertainty_net(features)
+
+        # Add batch statistics component - how much each feature varies across the batch
+        batch_std = features.std(dim=0, keepdim=True).expand(batch_size, -1)
+        batch_std = batch_std / (batch_std.max() + 1e-8)  # Normalize
+
+        # Combine components
+        combined_uncertainty = 0.7 * feature_uncertainty + 0.3 * batch_std
+
+        # Add a small random component to break symmetry
+        random_noise = torch.rand_like(combined_uncertainty) * 0.1
+        combined_uncertainty = combined_uncertainty + random_noise
+
+        # Normalize to [0, 1] range with a minimum value
+        combined_uncertainty = combined_uncertainty.clamp(min=0.01, max=1.0)
+
+        return combined_uncertainty
+
+    def adaptive_gating(self, features, uncertainties):
+        """Apply adaptive thresholding based on uncertainty
+
+        Parameters:
+        ----------
+        features: Tensor [batch_size, feature_dim]
+            Original features
+        uncertainties: Tensor [batch_size, feature_dim]
+            Uncertainty scores for each feature dimension
+
+        Returns:
+        ----------
+        gated_features: Tensor [batch_size, feature_dim]
+            Features after applying adaptive gating
+        thresholds: Tensor [batch_size, feature_dim]
+            Computed thresholds for each feature dimension
+        """
+        # Get base_threshold and beta from log-parameterized versions
+        base_threshold = self.base_threshold
+        beta_val = self.beta
+
+        # Compute adaptive thresholds - higher uncertainty means higher threshold
+        thresholds = base_threshold * (1.0 + beta_val * uncertainties)
+
+        # Normalize features for gating
+        feature_norms = torch.norm(features, dim=1, keepdim=True)
+        normalized_features = features / (feature_norms + 1e-8)
+        feature_magnitudes = torch.abs(normalized_features)
+
+        # Apply gating using a smooth transition for better gradients
+        sigmoid_scale = 20.0  # Steepness of the sigmoid
+        gating_mask = torch.sigmoid(sigmoid_scale * (feature_magnitudes - thresholds))
+        gated_features = features * gating_mask
+
+        # Store the actual gating mask for statistics
+        if self.training:
+            self.last_gating_mask = (feature_magnitudes >= thresholds).float().detach()
+
+        return gated_features, thresholds
+
     def forward(self, features):
-        """Forward pass simply passes features through
+        """Forward pass with optional adaptive gating
 
         Parameters:
         ----------
@@ -66,31 +201,148 @@ class DirectFeatureModel(torch.nn.Module):
         Returns:
         ----------
         features: Tensor [batch_size, feature_dim]
-            Same features, unchanged (dummy computation has no effect)
+            Original or gated features
         """
-        # Apply the identity projection + add scaled dummy computation (scaling factor = 0)
-        return self.projection(features) + self.dummy_linear(features) * 0.0
+        if self.gating_no_metanet:
+            # Apply gating to features
+            self._forward_count = getattr(self, '_forward_count', 0) + 1
+
+            # Store original features
+            self.last_orig_features = features.detach()
+
+            # Compute uncertainty
+            uncertainties = self.compute_uncertainty(features)
+            self.last_uncertainties = uncertainties
+
+            # Apply adaptive gating
+            gated_features, thresholds = self.adaptive_gating(features, uncertainties)
+            self.last_gated_features = gated_features
+            self.last_thresholds = thresholds
+
+            # Apply the dummy computation as before (zero-scaled)
+            return gated_features + self.dummy_linear(features) * 0.0
+        else:
+            # Original behavior - identity projection + dummy computation
+            return self.projection(features) + self.dummy_linear(features) * 0.0
 
     def uncertainty_regularization_loss(self):
-        """Dummy method to match AdaptiveGatingMetaNet interface
+        """Calculate regularization loss based on uncertainty and gating
 
         Returns:
         ----------
         loss: Tensor
-            Zero tensor for compatibility
+            Regularization loss
         """
-        # Return a small loss based on dummy parameter to ensure it receives gradient
-        return self.dummy_param.sum() * 0.0  # Multiply by 0 to not affect actual training
+        if not self.gating_no_metanet or self.uncertainty_reg < 1e-8:
+            # Return a small loss based on dummy parameter to ensure it receives gradient
+            return self.dummy_param.sum() * 0.0  # Multiply by 0 to not affect actual training
+
+        self._reg_loss_count = getattr(self, '_reg_loss_count', 0) + 1
+
+        # Check if we have the necessary stored values from forward pass
+        if (self.last_uncertainties is None or
+                self.last_gated_features is None or
+                self.last_orig_features is None):
+            return self.base_threshold * 0.001 + self.beta * 0.001
+
+        # Create mask for active (non-gated) features
+        active_mask = (self.last_gated_features != 0).float()
+
+        # Compute weighted uncertainty loss - only penalize non-zero features
+        uncertainty_loss = torch.sum(active_mask * self.last_uncertainties) * self.uncertainty_reg
+
+        # Add parameter regularization
+        init_beta = self.initial_beta.item()
+        init_threshold = self.initial_base_threshold.item()
+
+        # Calculate the distance from initial values
+        beta_dist = torch.abs(self.beta - init_beta)
+        threshold_dist = torch.abs(self.base_threshold - init_threshold)
+
+        # Encourage parameters to move away from initialization
+        reg_coefficient = 0.001
+        beta_reg = -torch.log(beta_dist.clamp(min=1e-5)) * reg_coefficient
+        threshold_reg = -torch.log(threshold_dist.clamp(min=1e-5)) * reg_coefficient
+
+        # Combine all losses
+        total_loss = uncertainty_loss + beta_reg + threshold_reg
+
+        return total_loss
 
     def get_gating_stats(self):
-        """Dummy method to match AdaptiveGatingMetaNet interface
+        """Get statistics about the gating process for monitoring
 
         Returns:
         ----------
         stats: dict
-            Empty dictionary for compatibility
+            Dictionary with gating statistics
         """
-        return {}
+        if not self.gating_no_metanet:
+            return {}
+
+        # Handle evaluation mode differently
+        if not getattr(self, 'training_mode', True):
+            batch_size = 1
+            features = torch.randn(batch_size, self.feature_dim, device=self.log_base_threshold.device)
+
+            with torch.no_grad():
+                uncertainties = self.compute_uncertainty(features)
+                base_threshold = self.base_threshold
+                beta_val = self.beta
+                thresholds = base_threshold * (1.0 + beta_val * uncertainties)
+
+                # Normalize features for gating mask calculation
+                feature_norms = torch.norm(features, dim=1, keepdim=True)
+                normalized_features = features / (feature_norms + 1e-8)
+                feature_magnitudes = torch.abs(normalized_features)
+
+                gating_mask = (feature_magnitudes >= thresholds).float()
+                gating_ratio = gating_mask.mean().item()
+
+                return {
+                    "gating_ratio": gating_ratio,
+                    "avg_threshold": thresholds.mean().item(),
+                    "base_threshold": self.base_threshold.item(),
+                    "beta": self.beta.item(),
+                    "log_base_threshold": self.log_base_threshold.item(),
+                    "log_beta": self.log_beta.item(),
+                    "forward_count": self._forward_count if hasattr(self, '_forward_count') else 0,
+                    "reg_loss_count": self._reg_loss_count if hasattr(self, '_reg_loss_count') else 0,
+                }
+
+        # Return training mode stats if available
+        if self.last_gated_features is None:
+            return {
+                "gating_ratio": 0.0,
+                "avg_threshold": self.base_threshold.item(),
+                "avg_uncertainty": 0.0,
+                "base_threshold": self.base_threshold.item(),
+                "beta": self.beta.item(),
+                "log_base_threshold": self.log_base_threshold.item(),
+                "log_beta": self.log_beta.item(),
+                "forward_count": self._forward_count if hasattr(self, '_forward_count') else 0,
+                "reg_loss_count": self._reg_loss_count if hasattr(self, '_reg_loss_count') else 0,
+            }
+
+        # Calculate active ratio
+        total_features = self.last_gated_features.numel()
+        nonzero_features = (self.last_gated_features != 0).sum().item()
+        gating_ratio = nonzero_features / total_features if total_features > 0 else 0.0
+
+        avg_threshold = self.last_thresholds.mean().item() if self.last_thresholds is not None else 0.0
+        avg_uncertainty = self.last_uncertainties.mean().item() if self.last_uncertainties is not None else 0.0
+
+        return {
+            "gating_ratio": gating_ratio,
+            "avg_threshold": avg_threshold,
+            "avg_uncertainty": avg_uncertainty,
+            "base_threshold": self.base_threshold.item(),
+            "beta": self.beta.item(),
+            "log_base_threshold": self.log_base_threshold.item(),
+            "log_beta": self.log_beta.item(),
+            "forward_count": self._forward_count if hasattr(self, '_forward_count') else 0,
+            "reg_loss_count": self._reg_loss_count if hasattr(self, '_reg_loss_count') else 0,
+        }
 
 
 class PrecomputedFeatureDataset(torch.utils.data.Dataset):
@@ -601,12 +853,20 @@ def train_with_adaptive_gating(rank, args):
             if is_main_process():
                 print(f"Feature dimension: {feature_dim}")
 
-            # Create model based on selected approach
             if args.no_metanet:
                 # Create direct feature model (Atlas approach)
-                model = DirectFeatureModel(feature_dim=feature_dim)
+                model = DirectFeatureModel(
+                    feature_dim=feature_dim,
+                    gating_no_metanet=args.gating_no_metanet,
+                    base_threshold=args.base_threshold,
+                    beta=args.beta,
+                    uncertainty_reg=args.uncertainty_reg
+                )
                 if is_main_process():
-                    print(f"Created DirectFeatureModel (Atlas approach)")
+                    if args.gating_no_metanet:
+                        print(f"Created DirectFeatureModel (Atlas approach) with gating mechanism")
+                    else:
+                        print(f"Created DirectFeatureModel (Atlas approach)")
             else:
                 # Create adaptive gating model (with or without gating)
                 model = AdaptiveGatingMetaNet(
@@ -636,7 +896,7 @@ def train_with_adaptive_gating(rank, args):
             ddp_model = torch.nn.parallel.DistributedDataParallel(
                 model,
                 device_ids=[args.rank],
-                find_unused_parameters=False
+                find_unused_parameters=True
             )
 
             # Setup classifier layer
@@ -700,7 +960,7 @@ def train_with_adaptive_gating(rank, args):
             loss_fn = torch.nn.CrossEntropyLoss()
 
             # Mixed precision training
-            scaler = GradScaler()
+            scaler = GradScaler('cuda')
 
             # Training monitoring
             train_losses = []
