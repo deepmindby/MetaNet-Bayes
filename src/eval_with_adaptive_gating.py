@@ -2,7 +2,8 @@
 
 This script evaluates Adaptive Gating MetaNet models using pre-computed features,
 with enhanced support for augmented data and detailed performance reporting.
-Also supports evaluation of models trained without gating mechanism or MetaNet.
+Also supports evaluation of models trained without gating mechanism or MetaNet,
+as well as Atlas models with direct gating mechanism.
 """
 
 import os
@@ -14,6 +15,7 @@ from collections import defaultdict
 from datetime import datetime
 from tqdm import tqdm
 import numpy as np
+import math
 
 from src.args import parse_arguments
 from src.adaptive_gating_metanet import AdaptiveGatingMetaNet
@@ -23,17 +25,28 @@ class DirectFeatureModel(torch.nn.Module):
     """
     A direct feature model that passes features directly to classifier without MetaNet transformations.
     This implements the Atlas approach using precomputed features.
+    When gating_no_metanet is enabled, it applies gating mechanism directly to features.
     """
-    def __init__(self, feature_dim):
+    def __init__(self, feature_dim, gating_no_metanet=False, base_threshold=0.05, beta=1.0, uncertainty_reg=0.01):
         """Initialize DirectFeatureModel
 
         Parameters:
         ----------
         feature_dim: int
             Dimension of the pre-computed feature vectors
+        gating_no_metanet: bool
+            Whether to apply gating mechanism directly to features
+        base_threshold: float
+            Base threshold for gating mechanism (only used if gating_no_metanet is True)
+        beta: float
+            Beta parameter for uncertainty weighting (only used if gating_no_metanet is True)
+        uncertainty_reg: float
+            Weight for uncertainty regularization (only used if gating_no_metanet is True)
         """
         super().__init__()
         self.feature_dim = feature_dim
+        self.gating_no_metanet = gating_no_metanet
+
         # Identity projection (no transformation)
         self.projection = torch.nn.Identity()
 
@@ -48,8 +61,135 @@ class DirectFeatureModel(torch.nn.Module):
         torch.nn.init.zeros_(self.dummy_linear.weight)
         torch.nn.init.zeros_(self.dummy_linear.bias)
 
+        # Adding gating mechanism if enabled
+        if self.gating_no_metanet:
+            # Initialize learnable gating parameters
+            self.log_base_threshold = torch.nn.Parameter(
+                torch.tensor([math.log(max(base_threshold, 1e-5))], dtype=torch.float)
+            )
+            self.log_beta = torch.nn.Parameter(
+                torch.tensor([math.log(max(beta * 0.95, 1e-5))], dtype=torch.float)
+            )
+
+            # Register buffers for monitoring
+            self.register_buffer('initial_base_threshold', torch.tensor([base_threshold], dtype=torch.float))
+            self.register_buffer('initial_beta', torch.tensor([beta], dtype=torch.float))
+
+            # Uncertainty related variables
+            self.uncertainty_reg = uncertainty_reg
+            self._forward_count = 0
+            self._reg_loss_count = 0
+            self.training_mode = True
+
+            # Storage for computed values during forward pass
+            self.last_uncertainties = None
+            self.last_gated_features = None
+            self.last_thresholds = None
+            self.last_orig_features = None
+            self.last_gating_mask = None
+
+            # Simple transform to generate feature-specific uncertainty
+            self.uncertainty_net = torch.nn.Sequential(
+                torch.nn.Linear(feature_dim, feature_dim // 4),
+                torch.nn.ReLU(),
+                torch.nn.Linear(feature_dim // 4, feature_dim),
+                torch.nn.Sigmoid()
+            )
+
+    @property
+    def base_threshold(self):
+        """Get the actual base threshold value (always positive)"""
+        if self.gating_no_metanet:
+            return torch.exp(self.log_base_threshold)
+        return torch.tensor(0.0)
+
+    @property
+    def beta(self):
+        """Get the actual beta value (always positive)"""
+        if self.gating_no_metanet:
+            return torch.exp(self.log_beta)
+        return torch.tensor(0.0)
+
+    def compute_uncertainty(self, features):
+        """Compute uncertainty based on feature characteristics
+
+        Parameters:
+        ----------
+        features: Tensor [batch_size, feature_dim]
+            Input features
+
+        Returns:
+        ----------
+        uncertainties: Tensor [batch_size, feature_dim]
+            Uncertainty scores for each feature dimension
+        """
+        batch_size = features.size(0)
+
+        # Get feature-specific uncertainty using the network
+        feature_uncertainty = self.uncertainty_net(features)
+
+        # Add batch statistics component - how much each feature varies across the batch
+        batch_std = features.std(dim=0, keepdim=True).expand(batch_size, -1)
+        batch_std = batch_std / (batch_std.max() + 1e-8)  # Normalize
+
+        # Combine components
+        combined_uncertainty = 0.7 * feature_uncertainty + 0.3 * batch_std
+
+        # Add a small random component to break symmetry during training
+        # In evaluation, use a fixed small value for deterministic results
+        if self.training_mode:
+            random_noise = torch.rand_like(combined_uncertainty) * 0.1
+        else:
+            random_noise = torch.ones_like(combined_uncertainty) * 0.05
+
+        combined_uncertainty = combined_uncertainty + random_noise
+
+        # Normalize to [0, 1] range with a minimum value
+        combined_uncertainty = combined_uncertainty.clamp(min=0.01, max=1.0)
+
+        return combined_uncertainty
+
+    def adaptive_gating(self, features, uncertainties):
+        """Apply adaptive thresholding based on uncertainty
+
+        Parameters:
+        ----------
+        features: Tensor [batch_size, feature_dim]
+            Original features
+        uncertainties: Tensor [batch_size, feature_dim]
+            Uncertainty scores for each feature dimension
+
+        Returns:
+        ----------
+        gated_features: Tensor [batch_size, feature_dim]
+            Features after applying adaptive gating
+        thresholds: Tensor [batch_size, feature_dim]
+            Computed thresholds for each feature dimension
+        """
+        # Get base_threshold and beta from log-parameterized versions
+        base_threshold = self.base_threshold
+        beta_val = self.beta
+
+        # Compute adaptive thresholds - higher uncertainty means higher threshold
+        thresholds = base_threshold * (1.0 + beta_val * uncertainties)
+
+        # Normalize features for gating
+        feature_norms = torch.norm(features, dim=1, keepdim=True)
+        normalized_features = features / (feature_norms + 1e-8)
+        feature_magnitudes = torch.abs(normalized_features)
+
+        # Apply gating using a smooth transition for better gradients
+        sigmoid_scale = 20.0  # Steepness of the sigmoid
+        gating_mask = torch.sigmoid(sigmoid_scale * (feature_magnitudes - thresholds))
+        gated_features = features * gating_mask
+
+        # Store the actual gating mask and thresholds for statistics
+        self.last_gating_mask = (feature_magnitudes >= thresholds).float().detach()
+
+        return gated_features, thresholds
+
     def forward(self, features):
-        """Forward pass simply passes features through
+        """Forward pass with optional adaptive gating
 
         Parameters:
         ----------
@@ -59,31 +199,139 @@ class DirectFeatureModel(torch.nn.Module):
         Returns:
         ----------
         features: Tensor [batch_size, feature_dim]
-            Same features, unchanged (dummy computation has no effect)
+            Original or gated features
         """
-        # Apply the identity projection + add scaled dummy computation (scaling factor = 0)
-        return self.projection(features) + self.dummy_linear(features) * 0.0
+        if self.gating_no_metanet:
+            # Apply gating to features
+            self._forward_count = getattr(self, '_forward_count', 0) + 1
+
+            # Store original features
+            self.last_orig_features = features.detach()
+
+            # Compute uncertainty
+            uncertainties = self.compute_uncertainty(features)
+            self.last_uncertainties = uncertainties
+
+            # Apply adaptive gating
+            gated_features, thresholds = self.adaptive_gating(features, uncertainties)
+            self.last_gated_features = gated_features
+            self.last_thresholds = thresholds
+
+            # Apply the dummy computation as before (zero-scaled)
+            return gated_features + self.dummy_linear(features) * 0.0
+        else:
+            # Original behavior - identity projection + add scaled dummy computation (scaling factor = 0)
+            return self.projection(features) + self.dummy_linear(features) * 0.0
 
     def uncertainty_regularization_loss(self):
-        """Dummy method to match AdaptiveGatingMetaNet interface
+        """Calculate regularization loss based on uncertainty and gating
 
         Returns:
         ----------
         loss: Tensor
-            Zero tensor for compatibility
+            Regularization loss
         """
-        # Return a small loss based on dummy parameter to ensure it receives gradient
-        return self.dummy_param.sum() * 0.0  # Multiply by 0 to not affect actual training
+        if not self.gating_no_metanet or self.uncertainty_reg < 1e-8:
+            # Return a small loss based on dummy parameter to ensure it receives gradient
+            return self.dummy_param.sum() * 0.0  # Multiply by 0 to not affect actual training
+
+        self._reg_loss_count = getattr(self, '_reg_loss_count', 0) + 1
+
+        # Check if we have the necessary stored values from forward pass
+        if (self.last_uncertainties is None or
+                self.last_gated_features is None or
+                self.last_orig_features is None):
+            return self.base_threshold * 0.001 + self.beta * 0.001
+
+        # Create mask for active (non-gated) features
+        active_mask = (self.last_gated_features != 0).float()
+
+        # Compute weighted uncertainty loss - only penalize non-zero features
+        uncertainty_loss = torch.sum(active_mask * self.last_uncertainties) * self.uncertainty_reg
+
+        # Add parameter regularization
+        init_beta = self.initial_beta.item()
+        init_threshold = self.initial_base_threshold.item()
+
+        # Calculate the distance from initial values
+        beta_dist = torch.abs(self.beta - init_beta)
+        threshold_dist = torch.abs(self.base_threshold - init_threshold)
+
+        # Encourage parameters to move away from initialization
+        reg_coefficient = 0.001
+        beta_reg = -torch.log(beta_dist.clamp(min=1e-5)) * reg_coefficient
+        threshold_reg = -torch.log(threshold_dist.clamp(min=1e-5)) * reg_coefficient
+
+        # Combine all losses
+        total_loss = uncertainty_loss + beta_reg + threshold_reg
+
+        return total_loss
 
     def get_gating_stats(self):
-        """Dummy method to match AdaptiveGatingMetaNet interface
+        """Get statistics about the gating process for monitoring
 
         Returns:
         ----------
         stats: dict
-            Empty dictionary for compatibility
+            Dictionary with gating statistics
         """
-        return {}
+        if not self.gating_no_metanet:
+            return {}
+
+        # Calculate gating statistics
+        if self.last_gated_features is None or self.last_gating_mask is None:
+            # Generate sample data for stats if none available
+            batch_size = 64
+            features = torch.randn(batch_size, self.feature_dim, device=self.log_base_threshold.device)
+
+            with torch.no_grad():
+                uncertainties = self.compute_uncertainty(features)
+                thresholds = self.base_threshold * (1.0 + self.beta * uncertainties)
+
+                # Normalize features for gating mask calculation
+                feature_norms = torch.norm(features, dim=1, keepdim=True)
+                normalized_features = features / (feature_norms + 1e-8)
+                feature_magnitudes = torch.abs(normalized_features)
+
+                gating_mask = (feature_magnitudes >= thresholds).float()
+                gating_ratio = gating_mask.mean().item()
+        else:
+            # Use stored values from forward pass
+            gating_ratio = self.last_gating_mask.mean().item()
+
+        # Get learned parameter values
+        current_base_threshold = self.base_threshold.item()
+        current_beta = self.beta.item()
+        current_log_base_threshold = self.log_base_threshold.item()
+        current_log_beta = self.log_beta.item()
+
+        # Get initial parameter values
+        initial_base_threshold = self.initial_base_threshold.item()
+        initial_beta = self.initial_beta.item()
+
+        # Calculate change from initial values
+        threshold_change = ((current_base_threshold - initial_base_threshold) / initial_base_threshold) * 100
+        beta_change = ((current_beta - initial_beta) / initial_beta) * 100
+
+        # Get average threshold if available
+        avg_threshold = self.last_thresholds.mean().item() if hasattr(self, 'last_thresholds') and self.last_thresholds is not None else current_base_threshold
+        avg_uncertainty = self.last_uncertainties.mean().item() if hasattr(self, 'last_uncertainties') and self.last_uncertainties is not None else 0.0
+
+        return {
+            "gating_ratio": gating_ratio,
+            "avg_threshold": avg_threshold,
+            "avg_uncertainty": avg_uncertainty,
+            "base_threshold": current_base_threshold,
+            "beta": current_beta,
+            "log_base_threshold": current_log_base_threshold,
+            "log_beta": current_log_beta,
+            "initial_base_threshold": initial_base_threshold,
+            "initial_beta": initial_beta,
+            "threshold_change_percent": threshold_change,
+            "beta_change_percent": beta_change,
+            "forward_count": self._forward_count if hasattr(self, '_forward_count') else 0,
+            "reg_loss_count": self._reg_loss_count if hasattr(self, '_reg_loss_count') else 0,
+        }
 
 
 class PrecomputedFeatureDataset(torch.utils.data.Dataset):
@@ -207,7 +455,7 @@ def cleanup_resources(dataset):
     torch.cuda.empty_cache()
 
 
-def find_model_path(model_dir, dataset_name, model_name, no_gating=False, no_metanet=False, debug=False):
+def find_model_path(model_dir, dataset_name, model_name, no_gating=False, no_metanet=False, gating_no_metanet=False, debug=False):
     """Find the model path for a given dataset, supporting different model types
 
     Args:
@@ -216,6 +464,7 @@ def find_model_path(model_dir, dataset_name, model_name, no_gating=False, no_met
         model_name: Name of the model (e.g., ViT-B-32)
         no_gating: Whether to look for a model trained without gating
         no_metanet: Whether to look for a model trained without MetaNet
+        gating_no_metanet: Whether to look for a model trained with gating on Atlas
         debug: Whether to print debug information
 
     Returns:
@@ -230,11 +479,14 @@ def find_model_path(model_dir, dataset_name, model_name, no_gating=False, no_met
 
     # Choose suffix based on model type
     if no_metanet:
-        gating_suffix = "_atlas"
+        if gating_no_metanet:
+            gating_suffix = "_atlas_gating"  # Atlas with gating
+        else:
+            gating_suffix = "_atlas"  # Standard Atlas
     elif no_gating:
-        gating_suffix = "_no_gating"
+        gating_suffix = "_no_gating"  # MetaNet without gating
     else:
-        gating_suffix = "_adaptive_gating"
+        gating_suffix = "_adaptive_gating"  # Standard adaptive gating
 
     # Model-specific directory
     model_specific_dir = os.path.join(model_dir, model_name)
@@ -245,13 +497,19 @@ def find_model_path(model_dir, dataset_name, model_name, no_gating=False, no_met
         if debug:
             print(f"Using model-specific directory: {model_dir}")
 
-    # Check these paths in order
+    # Check these paths in order with various naming conventions
     possible_paths = [
-        # Model-specific paths
+        # Model-specific paths with explicit naming
         os.path.join(model_dir, val_name, f"best{gating_suffix}_model.pt"),
         os.path.join(model_dir, val_name, f"best_{gating_suffix.strip('_')}_model.pt"),
         os.path.join(model_dir, base_name, f"best{gating_suffix}_model.pt"),
         os.path.join(model_dir, base_name, f"best_{gating_suffix.strip('_')}_model.pt"),
+
+        # Atlas with gating may have specific naming
+        os.path.join(model_dir, val_name, f"best_atlas_with_gating_model.pt"),
+        os.path.join(model_dir, base_name, f"best_atlas_with_gating_model.pt"),
+        os.path.join(model_dir, val_name, f"atlas_gating_model.pt"),
+        os.path.join(model_dir, base_name, f"atlas_gating_model.pt"),
     ]
 
     # Add standard paths that might be used as fallbacks
@@ -264,7 +522,7 @@ def find_model_path(model_dir, dataset_name, model_name, no_gating=False, no_met
 
     # Also try in top-level directories (for backward compatibility)
     if model_dir != model_specific_dir:
-        possible_paths.extend([
+        top_level_paths = [
             # Top-level directories
             os.path.join(model_specific_dir, val_name, f"best{gating_suffix}_model.pt"),
             os.path.join(model_specific_dir, val_name, f"best_{gating_suffix.strip('_')}_model.pt"),
@@ -272,7 +530,12 @@ def find_model_path(model_dir, dataset_name, model_name, no_gating=False, no_met
             os.path.join(model_specific_dir, base_name, f"best_{gating_suffix.strip('_')}_model.pt"),
             os.path.join(model_specific_dir, val_name, f"best_precomputed_model.pt"),
             os.path.join(model_specific_dir, base_name, f"best_precomputed_model.pt"),
-        ])
+
+            # Atlas with gating may have specific naming in top-level dirs too
+            os.path.join(model_specific_dir, val_name, f"best_atlas_with_gating_model.pt"),
+            os.path.join(model_specific_dir, base_name, f"best_atlas_with_gating_model.pt"),
+        ]
+        possible_paths.extend(top_level_paths)
 
     for path in possible_paths:
         if os.path.exists(path):
@@ -297,7 +560,14 @@ def find_model_path(model_dir, dataset_name, model_name, no_gating=False, no_met
                     print(f"Found model at: {path} (through directory search)")
                 return path
 
-    model_type = "Atlas" if no_metanet else "no-gating" if no_gating else "gating"
+    if no_metanet:
+        if gating_no_metanet:
+            model_type = "Atlas with Gating"
+        else:
+            model_type = "Atlas"
+    else:
+        model_type = "no-gating" if no_gating else "gating"
+
     raise FileNotFoundError(f"Could not find {model_type} model for {dataset_name} (model: {model_name}) in {model_dir}")
 
 
@@ -336,12 +606,24 @@ def evaluate_model(model_path, dataset, device, args):
 
         # Check for no_metanet flag in config
         no_metanet = config.get('no_metanet', False)
+        gating_no_metanet = config.get('gating_no_metanet', False)
 
         if no_metanet:
-            # Atlas model
-            print(f"Detected Atlas model (no MetaNet) for {model_name}")
+            # Atlas model (with or without gating)
+            if gating_no_metanet:
+                print(f"Detected Atlas model with Gating for {model_name}")
+
+                # Extract gating parameters if available
+                base_threshold = config.get('base_threshold', args.base_threshold)
+                beta = config.get('beta', args.beta)
+                uncertainty_reg = config.get('uncertainty_reg', args.uncertainty_reg)
+
+                print(f"  Gating parameters: αT={base_threshold:.4f}, β={beta:.4f}")
+            else:
+                print(f"Detected Atlas model (no MetaNet) for {model_name}")
+
             if args.debug:
-                print(f"Creating DirectFeatureModel")
+                print(f"Creating DirectFeatureModel with gating={gating_no_metanet}")
         else:
             # Check for MetaNet specific parameters
             num_task_vectors = config.get('num_task_vectors', args.num_task_vectors)
@@ -376,6 +658,7 @@ def evaluate_model(model_path, dataset, device, args):
 
         # Use provided arguments for model type
         no_metanet = args.no_metanet
+        gating_no_metanet = args.gating_no_metanet
 
         if not no_metanet:
             num_task_vectors = args.num_task_vectors
@@ -392,28 +675,37 @@ def evaluate_model(model_path, dataset, device, args):
             else:
                 print(f"Using default parameters for {model_name}: αT={base_threshold:.4f}, β={beta:.4f}")
         else:
-            print(f"Using Atlas implementation (direct features) for {model_name}")
+            if gating_no_metanet:
+                base_threshold = args.base_threshold
+                beta = args.beta
+                uncertainty_reg = args.uncertainty_reg
+                print(f"Using Atlas with gating mechanism for {model_name}: αT={base_threshold:.4f}, β={beta:.4f}")
+            else:
+                print(f"Using Atlas implementation (direct features) for {model_name}")
 
     # Create the appropriate model based on detected or specified type
     try:
         if args.debug:
             if no_metanet:
-                print("Creating DirectFeatureModel instance...")
+                if gating_no_metanet:
+                    print("Creating DirectFeatureModel instance with gating...")
+                else:
+                    print("Creating DirectFeatureModel instance...")
             else:
                 print("Creating AdaptiveGatingMetaNet instance...")
 
-        if no_metanet or args.no_metanet:
+        if no_metanet:
             # Create Atlas model with optional gating
+            use_gating = gating_no_metanet or args.gating_no_metanet
             model = DirectFeatureModel(
                 feature_dim=feature_dim,
-                gating_no_metanet=getattr(args, 'gating_no_metanet', False),
-                base_threshold=args.base_threshold,
-                beta=args.beta,
-                uncertainty_reg=args.uncertainty_reg
+                gating_no_metanet=use_gating,
+                base_threshold=args.base_threshold if not 'base_threshold' in locals() else base_threshold,
+                beta=args.beta if not 'beta' in locals() else beta,
+                uncertainty_reg=args.uncertainty_reg if not 'uncertainty_reg' in locals() else uncertainty_reg
             )
             if args.debug:
-                print(
-                    f"Created DirectFeatureModel for Atlas{' with gating' if getattr(args, 'gating_no_metanet', False) else ''}")
+                print(f"Created DirectFeatureModel for Atlas{' with gating' if use_gating else ''}")
         else:
             # Create MetaNet model
             model = AdaptiveGatingMetaNet(
@@ -447,6 +739,9 @@ def evaluate_model(model_path, dataset, device, args):
                 'model.image_encoder.meta_net.',
                 'dummy_param',  # For Atlas models
                 'dummy_linear',  # For Atlas models
+                'uncertainty_net',  # For Atlas models with gating
+                'log_base_threshold',  # For Atlas models with gating
+                'log_beta',  # For Atlas models with gating
             ]
 
             found_keys = False
@@ -491,6 +786,7 @@ def evaluate_model(model_path, dataset, device, args):
     # Get model type information for reporting
     model_info = {
         'no_metanet': no_metanet if 'no_metanet' in locals() else args.no_metanet,
+        'gating_no_metanet': gating_no_metanet if 'gating_no_metanet' in locals() else args.gating_no_metanet,
         'model_name': model_name,  # Keep track of model name
     }
 
@@ -501,6 +797,18 @@ def evaluate_model(model_path, dataset, device, args):
                 if hasattr(model, 'base_threshold') else 0.0,
             'beta': getattr(model, 'beta', torch.tensor(0.0)).item()
                 if hasattr(model, 'beta') else 0.0,
+        })
+    elif model_info['no_metanet'] and model_info['gating_no_metanet']:
+        # Get gating parameters for Atlas with gating
+        model_info.update({
+            'base_threshold': getattr(model, 'base_threshold', torch.tensor(0.0)).item()
+                if hasattr(model, 'base_threshold') else 0.0,
+            'beta': getattr(model, 'beta', torch.tensor(0.0)).item()
+                if hasattr(model, 'beta') else 0.0,
+            'log_base_threshold': getattr(model, 'log_base_threshold', torch.tensor(0.0)).item()
+                if hasattr(model, 'log_base_threshold') else 0.0,
+            'log_beta': getattr(model, 'log_beta', torch.tensor(0.0)).item()
+                if hasattr(model, 'log_beta') else 0.0,
         })
 
     # Create classifier
@@ -653,8 +961,11 @@ def evaluate_model(model_path, dataset, device, args):
 
     # Determine model type from parameters
     if model_info['no_metanet']:
-        model_type = "Atlas"
-    elif model_info['no_gating']:
+        if model_info['gating_no_metanet']:
+            model_type = "Atlas_WithGating"
+        else:
+            model_type = "Atlas"
+    elif model_info.get('no_gating', False):
         model_type = "MetaNet_NoGating"
     else:
         model_type = "AdaptiveGating"
@@ -664,8 +975,18 @@ def evaluate_model(model_path, dataset, device, args):
 
     # Get gating stats if applicable
     gating_stats = None
-    if not model_info['no_metanet'] and not model_info['no_gating'] and hasattr(model, 'get_gating_stats'):
-        gating_stats = model.get_gating_stats()
+    if (not model_info['no_metanet'] and not model_info.get('no_gating', False)) or \
+       (model_info['no_metanet'] and model_info['gating_no_metanet']):
+        if hasattr(model, 'get_gating_stats'):
+            gating_stats = model.get_gating_stats()
+
+            # Display detailed gating information for Atlas with Gating
+            if model_info['no_metanet'] and model_info['gating_no_metanet'] and gating_stats:
+                print("\nGating Parameters for Atlas with Gating:")
+                print(f"  Base threshold (αT): {gating_stats['base_threshold']:.4f} (initialized as {gating_stats['initial_base_threshold']:.4f}, change: {gating_stats['threshold_change_percent']:.2f}%)")
+                print(f"  Beta (β): {gating_stats['beta']:.4f} (initialized as {gating_stats['initial_beta']:.4f}, change: {gating_stats['beta_change_percent']:.2f}%)")
+                print(f"  Gating ratio: {gating_stats['gating_ratio']*100:.2f}% of features retained")
+                print(f"  Average threshold: {gating_stats['avg_threshold']:.4f}")
 
     # Compile complete results
     results = {
@@ -678,6 +999,7 @@ def evaluate_model(model_path, dataset, device, args):
         'config': {
             'feature_dim': feature_dim,
             'no_metanet': model_info['no_metanet'],
+            'gating_no_metanet': model_info['gating_no_metanet'] if model_info['no_metanet'] else False,
             'model_name': model_info['model_name'],  # Include model name in results
         },
         'model_path': model_path,
@@ -692,27 +1014,61 @@ def evaluate_model(model_path, dataset, device, args):
             'blockwise': blockwise if 'blockwise' in locals() else args.blockwise_coef,
             'base_threshold': model_info['base_threshold'],
             'beta': model_info['beta'],
-            'no_gating': model_info['no_gating'],
+            'no_gating': model_info.get('no_gating', False),
         })
 
-        # Add computed gating ratio for MetaNet models
-        if not model_info['no_gating'] and hasattr(model, 'get_gating_stats'):
+        # Add computed gating ratio for MetaNet models with gating
+        if not model_info.get('no_gating', False) and hasattr(model, 'get_gating_stats'):
             gating_ratio = gating_stats.get('gating_ratio', 0.0) if gating_stats else 0.0
             results['computed_gating_ratio'] = gating_ratio
 
+    # Add Atlas with Gating specific information if applicable
+    elif model_info['no_metanet'] and model_info['gating_no_metanet']:
+        results['config'].update({
+            'base_threshold': model_info['base_threshold'],
+            'beta': model_info['beta'],
+            'log_base_threshold': model_info.get('log_base_threshold', 0.0),
+            'log_beta': model_info.get('log_beta', 0.0),
+        })
+
+        # Add computed gating ratio and parameter change data for Atlas with gating
+        if hasattr(model, 'get_gating_stats'):
+            if gating_stats:
+                results['computed_gating_ratio'] = gating_stats.get('gating_ratio', 0.0)
+
+                # Add detailed parameter stats for Atlas with Gating
+                results['gating_parameter_evolution'] = {
+                    'initial_base_threshold': gating_stats.get('initial_base_threshold', 0.0),
+                    'final_base_threshold': gating_stats.get('base_threshold', 0.0),
+                    'threshold_change_percent': gating_stats.get('threshold_change_percent', 0.0),
+                    'initial_beta': gating_stats.get('initial_beta', 0.0),
+                    'final_beta': gating_stats.get('beta', 0.0),
+                    'beta_change_percent': gating_stats.get('beta_change_percent', 0.0),
+                }
+
     # Add gating stats if available
-    if gating_stats is not None and not model_info['no_metanet'] and not model_info['no_gating']:
-        results['gating_stats'] = {
-            'gating_ratio': gating_stats.get('gating_ratio', 0.0),
-            'avg_threshold': gating_stats.get('avg_threshold', 0.0),
-            'base_threshold': gating_stats.get('base_threshold', 0.0),
-            'beta': gating_stats.get('beta', 0.0)
-        }
+    if gating_stats is not None:
+        if (not model_info['no_metanet'] and not model_info.get('no_gating', False)) or \
+           (model_info['no_metanet'] and model_info['gating_no_metanet']):
+            results['gating_stats'] = {
+                'gating_ratio': gating_stats.get('gating_ratio', 0.0),
+                'avg_threshold': gating_stats.get('avg_threshold', 0.0),
+                'base_threshold': gating_stats.get('base_threshold', 0.0),
+                'beta': gating_stats.get('beta', 0.0),
+                'log_base_threshold': gating_stats.get('log_base_threshold', 0.0),
+                'log_beta': gating_stats.get('log_beta', 0.0),
+                'avg_uncertainty': gating_stats.get('avg_uncertainty', 0.0),
+                'initial_base_threshold': gating_stats.get('initial_base_threshold', 0.0),
+                'initial_beta': gating_stats.get('initial_beta', 0.0),
+                'threshold_change_percent': gating_stats.get('threshold_change_percent', 0.0),
+                'beta_change_percent': gating_stats.get('beta_change_percent', 0.0),
+            }
 
     if args.debug:
         print(f"Evaluation complete. Accuracy: {accuracy * 100:.2f}%")
 
-        if not model_info['no_metanet'] and not model_info['no_gating'] and gating_stats is not None:
+        if ((not model_info['no_metanet'] and not model_info.get('no_gating', False)) or \
+            (model_info['no_metanet'] and model_info['gating_no_metanet'])) and gating_stats is not None:
             print(f"Gating ratio: {gating_stats.get('gating_ratio', 0.0):.4f}")
 
     return results
@@ -740,7 +1096,10 @@ def main():
 
     # Generate descriptive suffix for results
     if args.no_metanet:
-        config_suffix = "_atlas"
+        if args.gating_no_metanet:
+            config_suffix = "_atlas_with_gating"
+        else:
+            config_suffix = "_atlas"
     elif args.no_gating:
         config_suffix = "_no_gating"
     else:
@@ -755,7 +1114,11 @@ def main():
     print(f"\n=== Evaluation Configuration ===")
     print(f"Model: {args.model}")
     if args.no_metanet:
-        print(f"Model type: Atlas (No MetaNet)")
+        if args.gating_no_metanet:
+            print(f"Model type: Atlas with Gating")
+            print(f"Base threshold (αT): {args.base_threshold:.4f}, Beta (β): {args.beta:.4f}")
+        else:
+            print(f"Model type: Atlas (No MetaNet)")
     else:
         print(f"Using MetaNet: {not args.no_metanet}")
         print(f"Blockwise coefficients: {args.blockwise_coef}")
@@ -802,6 +1165,7 @@ def main():
                     args.model,  # Pass model name to find_model_path
                     no_gating=args.no_gating,
                     no_metanet=args.no_metanet,
+                    gating_no_metanet=args.gating_no_metanet,
                     debug=args.debug
                 )
                 print(f"Using model: {os.path.basename(model_path)}")
@@ -831,6 +1195,22 @@ def main():
                 else:
                     print(f"Gating parameters: αT={results['config']['base_threshold']:.4f}, "
                         f"β={results['config']['beta']:.4f}")
+            elif results['config']['no_metanet'] and results['config'].get('gating_no_metanet', False):
+                if 'computed_gating_ratio' in results:
+                    print(f"Atlas with Gating - αT={results['config']['base_threshold']:.4f}, "
+                        f"β={results['config']['beta']:.4f}, "
+                        f"gating ratio={results['computed_gating_ratio']:.4f}")
+                else:
+                    print(f"Atlas with Gating - αT={results['config']['base_threshold']:.4f}, "
+                        f"β={results['config']['beta']:.4f}")
+
+                # Print parameter evolution if available
+                if 'gating_parameter_evolution' in results:
+                    param_evo = results['gating_parameter_evolution']
+                    print(f"Parameter evolution:")
+                    print(f"  αT: {param_evo['initial_base_threshold']:.4f} → {param_evo['final_base_threshold']:.4f} ({param_evo['threshold_change_percent']:.2f}%)")
+                    print(f"  β: {param_evo['initial_beta']:.4f} → {param_evo['final_beta']:.4f} ({param_evo['beta_change_percent']:.2f}%)")
+
             elif results['config']['no_metanet']:
                 print(f"Model type: Atlas (direct features)")
             else:
@@ -838,9 +1218,18 @@ def main():
 
             # Detailed output if requested
             if args.verbose:
-                if 'gating_stats' in results and not results['config']['no_metanet'] and not results['config'].get('no_gating', False):
+                if 'gating_stats' in results and ((not results['config']['no_metanet'] and not results['config'].get('no_gating', False)) or
+                                                 (results['config']['no_metanet'] and results['config'].get('gating_no_metanet', False))):
                     gating = results['gating_stats']
                     print(f"Gating details - ratio: {gating['gating_ratio']:.4f}, threshold: {gating['avg_threshold']:.4f}")
+
+                    # Show parameter evolution for Atlas with Gating
+                    if results['config']['no_metanet'] and results['config'].get('gating_no_metanet', False):
+                        print(f"Parameter evolution details:")
+                        print(f"  αT: {gating['initial_base_threshold']:.4f} → {gating['base_threshold']:.4f} ({gating['threshold_change_percent']:.2f}%)")
+                        print(f"  β: {gating['initial_beta']:.4f} → {gating['beta']:.4f} ({gating['beta_change_percent']:.2f}%)")
+                        print(f"  Log αT: {gating['log_base_threshold']:.4f}")
+                        print(f"  Log β: {gating['log_beta']:.4f}")
 
                 print("\nTop 5 classes by accuracy:")
                 per_class_report = results['per_class_report']
@@ -880,6 +1269,30 @@ def main():
                 if 'computed_gating_ratio' in results:
                     summary_entry['gating_ratio'] = results['computed_gating_ratio']
 
+            # Add Atlas with Gating information if applicable
+            elif results['config']['no_metanet'] and results['config'].get('gating_no_metanet', False):
+                # Include both original and learned parameters
+                if 'gating_parameter_evolution' in results:
+                    param_evo = results['gating_parameter_evolution']
+                    summary_entry.update({
+                        'initial_alpha': param_evo['initial_base_threshold'],
+                        'alpha': param_evo['final_base_threshold'],
+                        'alpha_change': param_evo['threshold_change_percent'],
+                        'initial_beta': param_evo['initial_beta'],
+                        'beta': param_evo['final_beta'],
+                        'beta_change': param_evo['beta_change_percent'],
+                        'gating_no_metanet': True,
+                    })
+                else:
+                    summary_entry.update({
+                        'alpha': results['config']['base_threshold'],
+                        'beta': results['config']['beta'],
+                        'gating_no_metanet': True,
+                    })
+
+                if 'computed_gating_ratio' in results:
+                    summary_entry['gating_ratio'] = results['computed_gating_ratio']
+
             summary_results.append(summary_entry)
 
         except Exception as e:
@@ -910,21 +1323,51 @@ def main():
     print(f"\nAll evaluation results saved to: {results_path}")
 
     # Print summary with improved alignment and separate sections for different model types
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 100)
     if args.no_metanet:
-        model_type_str = "Atlas (No MetaNet)"
+        if args.gating_no_metanet:
+            model_type_str = "Atlas with Gating"
+        else:
+            model_type_str = "Atlas (No MetaNet)"
     elif args.no_gating:
         model_type_str = "MetaNet (No Gating)"
     else:
         model_type_str = "Adaptive Gating MetaNet"
 
     print(f"Summary of {args.model} - {model_type_str} Models")
-    print("-" * 80)
+    print("-" * 100)
 
     # Group summary results by model type
-    atlas_results = [r for r in summary_results if r.get('no_metanet', False)]
+    atlas_with_gating_results = [r for r in summary_results if r.get('no_metanet', False) and r.get('gating_no_metanet', False)]
+    atlas_results = [r for r in summary_results if r.get('no_metanet', False) and not r.get('gating_no_metanet', False)]
     metanet_no_gating_results = [r for r in summary_results if not r.get('no_metanet', False) and r.get('no_gating', False)]
     adaptive_gating_results = [r for r in summary_results if not r.get('no_metanet', False) and not r.get('no_gating', False)]
+
+    # Print Atlas with Gating results
+    if atlas_with_gating_results:
+        print("\nAtlas with Gating Results:")
+        print(f"{'Dataset':<15} | {'Accuracy':^10} | {'Model':^10} | {'Init αT':^8} | {'αT':^8} | {'Change':^8} | {'Init β':^8} | {'β':^8} | {'Change':^8} | {'Gating %':^10}")
+        print("-" * 110)
+
+        for result in sorted(atlas_with_gating_results, key=lambda x: x['dataset']):
+            # Format fields with precise spacing and alignment
+            dataset_field = f"{result['dataset']:<15}"
+            accuracy_field = f"{result['accuracy']*100:>8.2f}%"
+            model_name_field = f"{result['model_name']:<10}"
+
+            # Handle cases where we don't have initial parameter data
+            init_alpha_field = f"{result.get('initial_alpha', result.get('alpha', 0)):>7.4f}"
+            alpha_field = f"{result.get('alpha', 0):>7.4f}"
+            alpha_change_field = f"{result.get('alpha_change', 0):>7.2f}%"
+
+            init_beta_field = f"{result.get('initial_beta', result.get('beta', 0)):>7.4f}"
+            beta_field = f"{result.get('beta', 0):>7.4f}"
+            beta_change_field = f"{result.get('beta_change', 0):>7.2f}%"
+
+            gating_field = f"{result.get('gating_ratio', 0)*100:>8.2f}%" if 'gating_ratio' in result else "   N/A   "
+
+            # Print with strict alignment using separators
+            print(f"{dataset_field} | {accuracy_field:^10} | {model_name_field:^10} | {init_alpha_field:^8} | {alpha_field:^8} | {alpha_change_field:^8} | {init_beta_field:^8} | {beta_field:^8} | {beta_change_field:^8} | {gating_field:^10}")
 
     # Print Atlas results
     if atlas_results:
@@ -977,7 +1420,7 @@ def main():
             # Print with strict alignment using separators
             print(f"{dataset_field} | {accuracy_field:^10} | {model_name_field:^10} | {alpha_field:^8} | {beta_field:^8} | {gating_field:^10} | {model_type_field:^25}")
 
-    print("=" * 80)
+    print("=" * 100)
 
 
 if __name__ == "__main__":

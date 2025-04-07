@@ -7,12 +7,13 @@
 BASE_DIR="/home/haichao/zby/MetaNet-Bayes"
 CHECKPOINTS_DIR="${BASE_DIR}/checkpoints_hyperparameter_tuning"
 DATA_LOCATION="${BASE_DIR}"
-MODEL="ViT-L-14"
+MODEL="ViT-B-32"
 BATCH_SIZE=128
 NUM_WORKERS=4
 GPU_ID=0
 VERBOSE=false
 FORCE_REEVALUATE=false
+GATING_NO_METANET=false
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
@@ -68,6 +69,10 @@ while [[ $# -gt 0 ]]; do
         FORCE_REEVALUATE=true
         shift
         ;;
+        --gating-no-metanet)
+        GATING_NO_METANET=true
+        shift
+        ;;
         --help)
         echo "自动模型评估脚本"
         echo "用法: $0 --dataset DATASET [选项]"
@@ -76,7 +81,7 @@ while [[ $# -gt 0 ]]; do
         echo "  --dataset DATASET     要评估的数据集名称(例如 SVHN, GTSRB)"
         echo ""
         echo "可选参数:"
-        echo "  --model MODEL         模型类型(默认: ViT-L-14)"
+        echo "  --model MODEL         模型类型(默认: ViT-B-32)"
         echo "  --gpu GPU_ID          GPU ID(默认: 0)"
         echo "  --base-dir DIR        基础目录(默认: /home/haichao/zby/MetaNet-Bayes)"
         echo "  --checkpoints-dir DIR 检查点目录(默认: BASE_DIR/checkpoints_hyperparameter_tuning)"
@@ -85,6 +90,7 @@ while [[ $# -gt 0 ]]; do
         echo "  --num-workers NUM     工作线程数(默认: 4)"
         echo "  --verbose             输出详细信息"
         echo "  --force               强制重新评估(即使已有结果)"
+        echo "  --gating-no-metanet   评估Atlas+Gating模型"
         exit 0
         ;;
         *)
@@ -119,11 +125,21 @@ echo "GPU: $GPU_ID" | tee -a "$LOG_FILE"
 echo "检查点目录: $CHECKPOINTS_DIR" | tee -a "$LOG_FILE"
 echo "数据位置: $DATA_LOCATION" | tee -a "$LOG_FILE"
 echo "输出目录: $OUTPUT_DIR" | tee -a "$LOG_FILE"
+if [ "$GATING_NO_METANET" = true ]; then
+    echo "评估模式: Atlas+Gating" | tee -a "$LOG_FILE"
+fi
 echo "===================================" | tee -a "$LOG_FILE"
+
+# 实验目录搜索模式
+EXP_SEARCH_PATTERN="exp_${DATASET}_*"
+if [ "$GATING_NO_METANET" = true ]; then
+    # 如果评估Atlas+Gating模型，则特别查找包含gatingnometanet的目录
+    EXP_SEARCH_PATTERN="exp_${DATASET}_*gatingnometanet*"
+fi
 
 # 查找与数据集相关的所有实验目录
 echo "正在查找与数据集 $DATASET 相关的实验..." | tee -a "$LOG_FILE"
-mapfile -t EXP_DIRS < <(find "$CHECKPOINTS_DIR" -maxdepth 1 -type d -name "exp_${DATASET}_*" | sort)
+mapfile -t EXP_DIRS < <(find "$CHECKPOINTS_DIR" -maxdepth 1 -type d -name "$EXP_SEARCH_PATTERN" | sort)
 
 if [ ${#EXP_DIRS[@]} -eq 0 ]; then
     echo "错误: 没有找到与数据集 $DATASET 相关的实验目录" | tee -a "$LOG_FILE"
@@ -150,21 +166,29 @@ extract_params_from_dir() {
     local wd=$(echo "$base_name" | grep -oP "wd\K[0-9.]+(?=_)" || echo "0.0005")
     local regc=$(echo "$base_name" | grep -oP "regc\K[0-9.]+(?=_)" || echo "0.001")
     local mw=$(echo "$base_name" | grep -oP "mw\K[0-9.]+(?=_)" || echo "0.0001")
+
     local blockwise=false
     if [[ "$base_name" == *"_blockwise"* ]]; then
         blockwise=true
     fi
+
     local no_gating=false
     if [[ "$base_name" == *"_nogating"* ]]; then
         no_gating=true
     fi
+
     local no_metanet=false
     if [[ "$base_name" == *"_nometanet"* ]]; then
         no_metanet=true
     fi
 
+    local gating_no_metanet=false
+    if [[ "$base_name" == *"_gatingnometanet"* ]]; then
+        gating_no_metanet=true
+    fi
+
     # 构建参数字符串(JSON格式)
-    echo "{\"base_threshold\": $bt, \"beta\": $beta, \"uncertainty_reg\": $ur, \"lr_multiplier\": $lrm, \"weight_decay\": $wd, \"reg_coefficient\": $regc, \"margin_weight\": $mw, \"blockwise\": $blockwise, \"no_gating\": $no_gating, \"no_metanet\": $no_metanet}"
+    echo "{\"base_threshold\": $bt, \"beta\": $beta, \"uncertainty_reg\": $ur, \"lr_multiplier\": $lrm, \"weight_decay\": $wd, \"reg_coefficient\": $regc, \"margin_weight\": $mw, \"blockwise\": $blockwise, \"no_gating\": $no_gating, \"no_metanet\": $no_metanet, \"gating_no_metanet\": $gating_no_metanet}"
 }
 
 # 读取缓存的评估结果(如果有)
@@ -198,6 +222,14 @@ try:
 
     for exp in cache:
         if not isinstance(exp, dict):
+            continue
+
+        # 如果指定了atlas+gating模式，只考虑gating_no_metanet=true的结果
+        if $GATING_NO_METANET and not exp.get('params', {}).get('gating_no_metanet', False):
+            continue
+
+        # 如果没有指定atlas+gating模式，但结果是atlas+gating，则跳过
+        if not $GATING_NO_METANET and exp.get('params', {}).get('gating_no_metanet', False):
             continue
 
         accuracy = float(exp.get('accuracy', 0))
@@ -249,6 +281,19 @@ if [ -z "$BEST_EXP_DIR" ]; then
         params=$(extract_params_from_dir "$exp_dir")
         echo "提取的参数: $params" | tee -a "$LOG_FILE"
 
+        # 检查是否匹配我们希望评估的模型类型
+        is_gating_no_metanet=$(echo "$params" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['gating_no_metanet'])")
+
+        if [ "$GATING_NO_METANET" = true ] && [ "$is_gating_no_metanet" != "True" ]; then
+            echo "跳过非Atlas+Gating模型" | tee -a "$LOG_FILE"
+            continue
+        fi
+
+        if [ "$GATING_NO_METANET" = false ] && [ "$is_gating_no_metanet" = "True" ]; then
+            echo "跳过Atlas+Gating模型（当前未指定评估此类型）" | tee -a "$LOG_FILE"
+            continue
+        fi
+
         # 在实验目录中查找模型目录
         model_dir="${exp_dir}/${MODEL}"
 
@@ -263,6 +308,7 @@ if [ -z "$BEST_EXP_DIR" ]; then
         blockwise=$(echo "$params" | python3 -c "import json,sys; print(str(json.loads(sys.stdin.read())['blockwise']).lower())")
         no_gating=$(echo "$params" | python3 -c "import json,sys; print(str(json.loads(sys.stdin.read())['no_gating']).lower())")
         no_metanet=$(echo "$params" | python3 -c "import json,sys; print(str(json.loads(sys.stdin.read())['no_metanet']).lower())")
+        gating_no_metanet=$(echo "$params" | python3 -c "import json,sys; print(str(json.loads(sys.stdin.read())['gating_no_metanet']).lower())")
 
         # 构建评估命令
         eval_cmd="CUDA_VISIBLE_DEVICES=$GPU_ID python -m src.eval_with_adaptive_gating"
@@ -277,23 +323,25 @@ if [ -z "$BEST_EXP_DIR" ]; then
         eval_cmd="$eval_cmd --verbose"
         eval_cmd="$eval_cmd --debug"  # 添加debug标志以获取更多信息
 
-        # 添加blockwise参数(如果需要)
+        # 添加模型类型特定参数
         if [ "$blockwise" = "true" ]; then
             eval_cmd="$eval_cmd --blockwise-coef"
         fi
 
-        # 添加no_gating参数(如果需要)
         if [ "$no_gating" = "true" ]; then
             eval_cmd="$eval_cmd --no-gating"
         fi
 
-        # 添加no_metanet参数(如果需要)
         if [ "$no_metanet" = "true" ]; then
             eval_cmd="$eval_cmd --no-metanet"
         fi
 
+        if [ "$gating_no_metanet" = "true" ]; then
+            eval_cmd="$eval_cmd --gating-no-metanet"
+        fi
+
         # 记录评估命令
-        # echo "评估命令: $eval_cmd" | tee -a "$DEBUG_FILE"
+        echo "评估命令: $eval_cmd" | tee -a "$DEBUG_FILE"
 
         # 执行评估并将输出重定向到临时文件
         exp_log_file="${OUTPUT_DIR}/${exp_name}_eval.log"
@@ -362,15 +410,29 @@ if [ -z "$BEST_EXP_DIR" ]; then
             fi
         fi
 
+        # 获取Atlas with Gating特有的参数变化信息
+        threshold_change=""
+        beta_change=""
+        if [ "$gating_no_metanet" = "true" ] && grep -q "αT.*change:" "$exp_log_file"; then
+            threshold_change=$(grep -oP "αT:.*?\(\K[+-][0-9.]+(?=%\))" "$exp_log_file" | tail -1)
+            beta_change=$(grep -oP "β:.*?\(\K[+-][0-9.]+(?=%\))" "$exp_log_file" | tail -1)
+        fi
+
         echo "测试准确率: $accuracy%" | tee -a "$LOG_FILE"
         if [ -n "$gating_ratio" ]; then
             echo "门控比例: $gating_ratio%" | tee -a "$LOG_FILE"
+        fi
+        if [ -n "$threshold_change" ] && [ -n "$beta_change" ]; then
+            echo "参数变化: αT: ${threshold_change}%, β: ${beta_change}%" | tee -a "$LOG_FILE"
         fi
 
         # 保存结果
         result="{\"exp_dir\": \"$exp_dir\", \"accuracy\": $accuracy, \"params\": $params"
         if [ -n "$gating_ratio" ]; then
             result="$result, \"gating_ratio\": $gating_ratio"
+        fi
+        if [ -n "$threshold_change" ] && [ -n "$beta_change" ]; then
+            result="$result, \"threshold_change\": $threshold_change, \"beta_change\": $beta_change"
         fi
         result="$result}"
         ALL_RESULTS+=("$result")
@@ -442,6 +504,11 @@ if [ -n "$BEST_EXP_DIR" ] && [ "$BEST_ACCURACY" != "0.0" ]; then
     echo "==================== 评估总结 ====================" | tee -a "$SUMMARY_FILE"
     echo "数据集: $DATASET" | tee -a "$SUMMARY_FILE"
     echo "模型: $MODEL" | tee -a "$SUMMARY_FILE"
+
+    if [ "$GATING_NO_METANET" = true ]; then
+        echo "评估模式: Atlas+Gating" | tee -a "$SUMMARY_FILE"
+    fi
+
     echo "" | tee -a "$SUMMARY_FILE"
     echo "最佳实验目录: $BEST_EXP_DIR" | tee -a "$SUMMARY_FILE"
     echo "最佳测试准确率: $BEST_ACCURACY%" | tee -a "$SUMMARY_FILE"
@@ -492,6 +559,9 @@ for key, value in params.items():
 
     # 创建模型评估结果的符号链接
     LATEST_LINK="${BASE_DIR}/evaluation_results/${DATASET}_${MODEL}_latest"
+    if [ "$GATING_NO_METANET" = true ]; then
+        LATEST_LINK="${LATEST_LINK}_atlas_gating"
+    fi
     rm -f "$LATEST_LINK" 2>/dev/null
     ln -s "$OUTPUT_DIR" "$LATEST_LINK"
     echo "创建了指向最新结果的符号链接: $LATEST_LINK"

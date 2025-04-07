@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# 自适应门控超参数调优脚本 - 简化版
-# 直接在8张GPU上平均分配任务，不进行复杂的GPU检查
+# 自适应门控超参数调优脚本 - 支持Atlas+Gating
+# 在可用GPU上平均分配任务
 
 # 基础设置
-MODEL="ViT-B-16"  # 可选: ViT-B-32, RN50, RN101 等
+MODEL="ViT-B-32"  # 可选: ViT-B-16, ViT-B-32, ViT-L-14 等
 SAVE_DIR="/home/haichao/zby/MetaNet-Bayes/checkpoints_hyperparameter_tuning"
-DATA_LOCATION="~/zby/MetaNet-Bayes"
+DATA_LOCATION="/home/haichao/zby/MetaNet-Bayes"
 BATCH_SIZE=64
 EPOCHS=10
 NUM_WORKERS=4
@@ -24,33 +24,25 @@ RESULTS_FILE="${LOG_DIR}/tuning_results.csv"
 mkdir -p "$LOG_DIR"
 
 # 初始化结果CSV文件
-echo "dataset,base_threshold,beta,uncertainty_reg,blockwise,no_gating,no_metanet,train_accuracy,model,gpu_id,time_minutes" > "$RESULTS_FILE"
+echo "dataset,base_threshold,beta,uncertainty_reg,blockwise,no_gating,no_metanet,gating_no_metanet,train_accuracy,model,gpu_id,time_minutes" > "$RESULTS_FILE"
 
 # 要测试的数据集
-DATASETS=("MNIST")
+DATASETS=("MNIST" "SVHN" "DTD" "EuroSAT")
 #DATASETS=("MNIST" "RESISC45" "SUN397" "SVHN")
 #DATASETS=("Cars" "DTD" "EuroSAT" "GTSRB" "MNIST" "RESISC45" "SUN397" "SVHN")
 
-# 超参数搜索空间
-BASE_THRESHOLDS=(0.01 0.03 0.05 0.06 0.07)
-BETAS=(0.8 1.0 1.2)
-UNCERTAINTY_REGS=(0.008 0.01 0.015 0.02)
-LR_MULTIPLIERS=(20.0 30.0 40.0 50.0 60.0 70.0 100.0)
-WEIGHT_DECAYS=(0.0005)
-REG_COEFFICIENTS=(0.0008 0.001 0.0012 0.002)
-MARGIN_WEIGHTS=(0.00005 0.0001 0.0002 0.0005 0.0006)
-#BASE_THRESHOLDS=(0.05)
-#BETAS=(1.0)
-#UNCERTAINTY_REGS=(0.01)
-#LR_MULTIPLIERS=(50.0)
-#WEIGHT_DECAYS=(0.0005)
-#REG_COEFFICIENTS=(0.0008 0.001)
-#MARGIN_WEIGHTS=(0.0001)
-
+# Atlas+Gating超参数搜索空间
+BASE_THRESHOLDS=(0.01 0.03 0.05 0.07 0.1)
+BETAS=(0.5 0.8 1.0 1.2 1.5)
+UNCERTAINTY_REGS=(0.005 0.01 0.015 0.02)
+LR_MULTIPLIERS=(20.0 30.0 50.0 70.0 100.0)
+WEIGHT_DECAYS=(0.0001 0.0005 0.001)
+REG_COEFFICIENTS=(0.0005 0.001 0.002)
+MARGIN_WEIGHTS=(0.00005 0.0001 0.0005)
 
 # 设置实验标题
 echo "========================================"
-echo "多GPU超参数调优实验 - $(date)"
+echo "Atlas+Gating超参数调优实验 - $(date)"
 echo "模型: $MODEL"
 echo "保存目录: $SAVE_DIR"
 echo "数据集: ${DATASETS[@]}"
@@ -81,8 +73,9 @@ run_experiment() {
     local blockwise=$5
     local no_gating=$6
     local no_metanet=$7
-    local gpu_id=$8
-    local task_id=$9
+    local gating_no_metanet=$8
+    local gpu_id=$9
+    local task_id=${10}
 
     # 为每个实验设置唯一端口，避免冲突
     local port=$((12000 + task_id))
@@ -92,6 +85,7 @@ run_experiment() {
     if $blockwise; then exp_name="${exp_name}_blockwise"; fi
     if $no_gating; then exp_name="${exp_name}_nogating"; fi
     if $no_metanet; then exp_name="${exp_name}_nometanet"; fi
+    if $gating_no_metanet; then exp_name="${exp_name}_gatingnometanet"; fi
 
     local exp_save_dir="${SAVE_DIR}/${exp_name}"
     local log_file="${LOG_DIR}/${exp_name}_gpu${gpu_id}.log"
@@ -122,6 +116,7 @@ run_experiment() {
     if $blockwise; then cmd="$cmd --blockwise-coef"; fi
     if $no_gating; then cmd="$cmd --no-gating"; fi
     if $no_metanet; then cmd="$cmd --no-metanet"; fi
+    if $gating_no_metanet; then cmd="$cmd --gating-no-metanet"; fi
 
     # 运行命令并记录输出
     echo "$cmd" > "$log_file"
@@ -153,7 +148,7 @@ run_experiment() {
         fi
 
         # 记录结果到CSV - 只记录训练指标
-        echo "$dataset,$base_threshold,$beta,$uncertainty_reg,$blockwise,$no_gating,$no_metanet,$train_accuracy,$MODEL,$gpu_id,$duration_minutes" >> "$RESULTS_FILE"
+        echo "$dataset,$base_threshold,$beta,$uncertainty_reg,$blockwise,$no_gating,$no_metanet,$gating_no_metanet,$train_accuracy,$MODEL,$gpu_id,$duration_minutes" >> "$RESULTS_FILE"
 
         echo -e "\n完成实验: $exp_name, 训练指标: $train_accuracy (GPU $gpu_id), 耗时: ${duration_minutes}分钟"
     ) &
@@ -181,46 +176,49 @@ add_experiment_task() {
     local blockwise=$5
     local no_gating=$6
     local no_metanet=$7
+    local gating_no_metanet=$8
 
-    EXPERIMENT_TASKS+=("$dataset $base_threshold $beta $uncertainty_reg $blockwise $no_gating $no_metanet")
+    EXPERIMENT_TASKS+=("$dataset $base_threshold $beta $uncertainty_reg $blockwise $no_gating $no_metanet $gating_no_metanet")
 }
 
 # 创建实验任务列表
 echo "准备实验任务..."
 
-# 实验1: MetaNet带自适应门控
+# 实验组1: 比较不同方法
 for dataset in "${DATASETS[@]}"; do
+    # Atlas+Gating方法
+    add_experiment_task "$dataset" 0.05 1.0 0.01 false false true true
+    # 标准Atlas方法
+    add_experiment_task "$dataset" 0.05 1.0 0.01 false false true false
     # 标准MetaNet(带自适应门控)
-    add_experiment_task "$dataset" 0.05 1.0 0.01 true false false
+    add_experiment_task "$dataset" 0.05 1.0 0.01 true false false false
     # MetaNet无门控
-    add_experiment_task "$dataset" 0.05 1.0 0.01 true true false
-    # Atlas方法
-    add_experiment_task "$dataset" 0.05 1.0 0.01 true false true
+    add_experiment_task "$dataset" 0.05 1.0 0.01 true true false false
 done
 
-# 实验2: 比较不同的base_threshold
+# 实验组2: Atlas+Gating - 比较不同的base_threshold
 for dataset in "${DATASETS[@]}"; do
     for base_threshold in "${BASE_THRESHOLDS[@]}"; do
         if [ "$base_threshold" != "0.05" ]; then  # 避免重复
-            add_experiment_task "$dataset" $base_threshold 1.0 0.01 true false false
+            add_experiment_task "$dataset" $base_threshold 1.0 0.01 false false true true
         fi
     done
 done
 
-# 实验3: 比较不同的beta
+# 实验组3: Atlas+Gating - 比较不同的beta
 for dataset in "${DATASETS[@]}"; do
     for beta in "${BETAS[@]}"; do
         if [ "$beta" != "1.0" ]; then  # 避免重复
-            add_experiment_task "$dataset" 0.05 $beta 0.01 true false false
+            add_experiment_task "$dataset" 0.05 $beta 0.01 false false true true
         fi
     done
 done
 
-# 实验4: 比较不同的uncertainty_reg
+# 实验组4: Atlas+Gating - 比较不同的uncertainty_reg
 for dataset in "${DATASETS[@]}"; do
     for uncertainty_reg in "${UNCERTAINTY_REGS[@]}"; do
         if [ "$uncertainty_reg" != "0.01" ]; then  # 避免重复
-            add_experiment_task "$dataset" 0.05 1.0 $uncertainty_reg true false false
+            add_experiment_task "$dataset" 0.05 1.0 $uncertainty_reg false false true true
         fi
     done
 done
@@ -249,17 +247,17 @@ for i in $(seq 0 $((TOTAL_EXPERIMENTS-1))); do
 
     # 解析任务参数
     task=${EXPERIMENT_TASKS[$i]}
-    read -r dataset base_threshold beta uncertainty_reg blockwise no_gating no_metanet <<< "$task"
+    read -r dataset base_threshold beta uncertainty_reg blockwise no_gating no_metanet gating_no_metanet <<< "$task"
 
     # 启动实验
-    run_experiment "$dataset" "$base_threshold" "$beta" "$uncertainty_reg" "$blockwise" "$no_gating" "$no_metanet" "$gpu_id" "$i"
+    run_experiment "$dataset" "$base_threshold" "$beta" "$uncertainty_reg" "$blockwise" "$no_gating" "$no_metanet" "$gating_no_metanet" "$gpu_id" "$i"
 
     # 简单进度显示
     COMPLETED_TASKS=$((i+1))
     show_progress $COMPLETED_TASKS $TOTAL_EXPERIMENTS
 
     # 短暂暂停以避免同时启动过多进程
-    sleep 0.5
+    sleep 1
 done
 
 echo -e "\n所有实验已启动! 等待完成..."
@@ -300,17 +298,24 @@ with open('${LOG_DIR}/training_summary.txt', 'w') as f:
             f.write(f'\\n{dataset}:\\n')
             f.write(f'  最佳训练指标: {best_row[\"train_accuracy\"]}\\n')
             f.write(f'  参数: base_threshold={best_row[\"base_threshold\"]}, beta={best_row[\"beta\"]}, uncertainty_reg={best_row[\"uncertainty_reg\"]}\\n')
-            f.write(f'  blockwise={best_row[\"blockwise\"]}, no_gating={best_row[\"no_gating\"]}, no_metanet={best_row[\"no_metanet\"]}\\n')
+            f.write(f'  blockwise={best_row[\"blockwise\"]}, no_gating={best_row[\"no_gating\"]}, no_metanet={best_row[\"no_metanet\"]}, gating_no_metanet={best_row[\"gating_no_metanet\"]}\\n')
 
     # 各方法的比较
     f.write('\\n\\n不同方法的训练指标比较:\\n')
     methods = []
+
+    # 定义不同方法
+    if (results['no_metanet'] == True).any() and (results['gating_no_metanet'] == True).any():
+        methods.append(('Atlas with Gating', (results['no_metanet'] == True) & (results['gating_no_metanet'] == True)))
+
+    if (results['no_metanet'] == True).any() and (results['gating_no_metanet'] == False).any():
+        methods.append(('Atlas (No Gating)', (results['no_metanet'] == True) & (results['gating_no_metanet'] == False)))
+
     if (results['no_metanet'] == False).any() and (results['no_gating'] == False).any():
         methods.append(('MetaNet with Gating', (results['no_metanet'] == False) & (results['no_gating'] == False)))
+
     if (results['no_metanet'] == False).any() and (results['no_gating'] == True).any():
         methods.append(('MetaNet without Gating', (results['no_metanet'] == False) & (results['no_gating'] == True)))
-    if (results['no_metanet'] == True).any():
-        methods.append(('Atlas (Direct Features)', results['no_metanet'] == True))
 
     for method_name, mask in methods:
         method_results = results[mask]
@@ -325,6 +330,29 @@ with open('${LOG_DIR}/training_summary.txt', 'w') as f:
                 if not dataset_method.empty and dataset_method['train_accuracy'].notna().any():
                     best_acc = dataset_method['train_accuracy'].max()
                     f.write(f'  {dataset}: {best_acc:.2f}\\n')
+
+    # Atlas+Gating的超参数影响分析
+    atlas_gating_results = results[(results['no_metanet'] == True) & (results['gating_no_metanet'] == True)]
+    if not atlas_gating_results.empty:
+        f.write('\\n\\nAtlas+Gating超参数分析:\\n')
+
+        # 分析base_threshold的影响
+        f.write('\\nbase_threshold参数的影响:\\n')
+        threshold_groups = atlas_gating_results.groupby('base_threshold')['train_accuracy'].mean()
+        for threshold, acc in threshold_groups.items():
+            f.write(f'  αT={threshold}: {acc:.2f}\\n')
+
+        # 分析beta的影响
+        f.write('\\nbeta参数的影响:\\n')
+        beta_groups = atlas_gating_results.groupby('beta')['train_accuracy'].mean()
+        for beta, acc in beta_groups.items():
+            f.write(f'  β={beta}: {acc:.2f}\\n')
+
+        # 分析uncertainty_reg的影响
+        f.write('\\nuncertainty_reg参数的影响:\\n')
+        ur_groups = atlas_gating_results.groupby('uncertainty_reg')['train_accuracy'].mean()
+        for ur, acc in ur_groups.items():
+            f.write(f'  不确定性正则化={ur}: {acc:.2f}\\n')
 
     f.write('\\n注意: 此摘要仅包含训练指标，不包含评估结果。请使用evaluate_model.sh脚本进行正式评估。\\n')
 "
