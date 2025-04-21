@@ -12,7 +12,7 @@ import torch
 import random
 import numpy as np
 import matplotlib.pyplot as plt
-from torch.amp import GradScaler, autocast
+# Removed GradScaler and autocast imports
 import gc
 import traceback
 from datetime import datetime
@@ -22,6 +22,7 @@ from src.adaptive_gating_metanet import AdaptiveGatingMetaNet
 from src.utils import cosine_lr
 from src.datasets.common import maybe_dictionarize
 from src.distributed import cleanup_ddp, distribute_loader, is_main_process, setup_ddp
+from src.visualize_coefficients import visualize_task_vector_coefficients
 
 from src.args import parse_arguments
 args = parse_arguments()
@@ -1059,8 +1060,8 @@ def train_with_adaptive_gating(rank, args):
             # Loss function
             loss_fn = torch.nn.CrossEntropyLoss()
 
-            # 修复混合精度训练 - 正确初始化GradScaler
-            scaler = GradScaler(enabled=True)  # 修正GradScaler初始化方式
+            # Remove the GradScaler initialization
+            # scaler = GradScaler(enabled=True)
 
             # Training monitoring
             train_losses = []
@@ -1095,28 +1096,26 @@ def train_with_adaptive_gating(rank, args):
                         features = batch["features"].to(rank)
                         labels = batch["labels"].to(rank)
 
-                        # 使用autocast上下文管理器来启用混合精度训练
-                        with autocast(enabled=True):  # 明确启用autocast
-                            # Forward pass
-                            transformed_features = ddp_model(features)
-                            logits = classifier(transformed_features)
+                        # Remove the autocast context
+                        # Forward pass
+                        transformed_features = ddp_model(features)
+                        logits = classifier(transformed_features)
 
-                            # Task loss
-                            task_loss = loss_fn(logits, labels)
+                        # Task loss
+                        task_loss = loss_fn(logits, labels)
 
-                            # Add uncertainty regularization
-                            # Will be effectively 0 for Atlas or no-gating models
-                            reg_loss = ddp_model.module.uncertainty_regularization_loss()
+                        # Add uncertainty regularization
+                        # Will be effectively 0 for Atlas or no-gating models
+                        reg_loss = ddp_model.module.uncertainty_regularization_loss()
 
-                            total_loss = task_loss + reg_loss
+                        total_loss = task_loss + reg_loss
 
-                        # Backward pass
-                        scaler.scale(total_loss).backward()
+                        # Backward pass - replace scaler usage with standard backward
+                        total_loss.backward()
 
-                        # Step optimizer
+                        # Step optimizer - standard version without scaler
                         scheduler(i + epoch * num_batches)
-                        scaler.step(optimizer)
-                        scaler.update()
+                        optimizer.step()
                         optimizer.zero_grad()
 
                         # Record stats
@@ -1430,6 +1429,35 @@ def train_with_adaptive_gating(rank, args):
             torch.cuda.empty_cache()
             gc.collect()
 
+    if is_main_process():
+        # Generate visualizations for all datasets
+        try:
+            print("Generating task vector coefficient visualizations for all datasets...")
+
+            # Create a common visualization directory for all models
+            vis_dir = os.path.join(model_save_dir, "visualizations")
+            os.makedirs(vis_dir, exist_ok=True)
+
+            # Generate visualization for standard task vectors
+            visualization_path = visualize_task_vector_coefficients(
+                model_dir=model_save_dir,  # This should contain all dataset subdirectories
+                output_dir=vis_dir,
+                datasets=None,  # Automatically detect all datasets
+                model_name=args.model,
+                max_vectors_to_show=8,
+                max_blocks_per_vector=12
+            )
+
+            if visualization_path:
+                print(f"Visualization for standard task vectors saved to: {visualization_path}")
+            else:
+                print("Failed to generate visualization for standard task vectors")
+        except Exception as e:
+            print(f"Warning: Failed to generate visualizations: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # Clean up distributed environment
     cleanup_ddp()
 
 

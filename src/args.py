@@ -206,6 +206,43 @@ def parse_arguments():
         default=False,
         help="Apply gating mechanism directly to Atlas (no-metanet) model"
     )
+    # Variational inference parameters
+    parser.add_argument(
+        "--kl-weight",
+        type=float,
+        default=0.01,
+        help="Weight for KL divergence in ELBO"
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=5,
+        help="Number of MC samples during training"
+    )
+    parser.add_argument(
+        "--num-eval-samples",
+        type=int,
+        default=20,
+        help="Number of MC samples during evaluation"
+    )
+    parser.add_argument(
+        "--save-uncertainty",
+        action="store_true",
+        default=False,
+        help="Save uncertainty analysis plots and data"
+    )
+    parser.add_argument(
+        "--detailed-analysis",
+        action="store_true",
+        default=False,
+        help="Perform detailed feature importance analysis"
+    )
+    parser.add_argument(
+        "--variational-gating",
+        action="store_true",
+        default=True,
+        help="Enable variational gating mechanism"
+    )
 
     parsed_args = parser.parse_args()
     parsed_args.device = "cuda" if torch.cuda.is_available() else "cpu"

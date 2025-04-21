@@ -2,7 +2,7 @@
 Evaluation script for Variational MetaNet models.
 
 This script provides evaluation capabilities for Variational MetaNet models,
-including Monte Carlo inference, uncertainty metrics, and visualization.
+focusing only on reliability diagram visualization.
 """
 
 import os
@@ -16,12 +16,6 @@ import gc
 import traceback
 
 from src.variational_metanet import VariationalMetaNet
-from src.utils_variational import (
-    get_uncertainty_metrics,
-    visualize_posterior_distribution,
-    save_uncertainty_analysis,
-    plot_reliability_diagram
-)
 from src.args import parse_arguments
 
 # Parse arguments
@@ -29,8 +23,40 @@ args = parse_arguments()
 
 # Add variational-specific arguments
 args.num_eval_samples = 20  # Number of MC samples for evaluation
-args.save_uncertainty = True  # Whether to save uncertainty analysis
-args.detailed_analysis = False  # Whether to perform detailed feature importance analysis
+args.save_uncertainty = True  # Whether to save reliability diagram
+args.detailed_analysis = False  # Not used in this simplified version
+
+
+def convert_to_python_types(obj):
+    """Convert numpy or torch types to native Python types.
+
+    Args:
+        obj: Object that may contain numpy or torch types
+
+    Returns:
+        Object with numpy/torch types converted to Python native types
+    """
+    if isinstance(obj, (np.integer, np.int32, np.int64)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        if obj.size == 1:  # Single element array
+            return convert_to_python_types(obj.item())
+        return [convert_to_python_types(x) for x in obj.tolist()]
+    elif isinstance(obj, torch.Tensor):
+        if obj.numel() == 1:  # Single element tensor
+            return float(obj.item())
+        return convert_to_python_types(obj.detach().cpu().numpy())
+    elif isinstance(obj, list):
+        return [convert_to_python_types(x) for x in obj]
+    elif isinstance(obj, tuple):
+        return tuple(convert_to_python_types(x) for x in obj)
+    elif isinstance(obj, dict):
+        return {convert_to_python_types(k): convert_to_python_types(v) for k, v in obj.items()}
+    else:
+        return obj
+
 
 class PrecomputedFeatureDataset(torch.utils.data.Dataset):
     """Dataset for precomputed features with minimal logging"""
@@ -231,15 +257,14 @@ def find_model_path(model_dir, dataset_name, model_name, debug=False):
         f"Could not find variational model for {dataset_name} (model: {model_name}) in {model_dir}")
 
 
-# Custom multi-class expected calibration error function
 def expected_calibration_error(y_true, y_prob, n_bins=10):
     """Calculate Expected Calibration Error (ECE) for multi-class problems.
 
     Parameters:
     ----------
-    y_true: np.ndarray
+    y_true: np.ndarray or torch.Tensor
         Ground truth labels
-    y_prob: np.ndarray
+    y_prob: np.ndarray or torch.Tensor
         Predicted probabilities
     n_bins: int
         Number of bins for ECE calculation
@@ -248,6 +273,12 @@ def expected_calibration_error(y_true, y_prob, n_bins=10):
     ----------
     ece: float
         Expected Calibration Error
+    bin_accs: list
+        Accuracy for each bin
+    bin_confs: list
+        Confidence for each bin
+    bin_counts: list
+        Sample counts for each bin
     """
     # Convert to numpy if tensors
     if isinstance(y_true, torch.Tensor):
@@ -279,36 +310,90 @@ def expected_calibration_error(y_true, y_prob, n_bins=10):
     bin_indices = np.clip(bin_indices, 0, n_bins - 1)
 
     # Initialize arrays to store bin statistics
-    bin_accuracies = np.zeros(n_bins)
-    bin_confidences = np.zeros(n_bins)
-    bin_counts = np.zeros(n_bins)
+    bin_accs = []
+    bin_confs = []
+    bin_counts = []
 
     # Compute bin statistics
     for i in range(n_bins):
         mask = (bin_indices == i)
         if np.any(mask):
-            bin_accuracies[i] = np.mean(accuracies[mask])
-            bin_confidences[i] = np.mean(confidence[mask])
-            bin_counts[i] = np.sum(mask)
+            bin_accs.append(float(np.mean(accuracies[mask])))
+            bin_confs.append(float(np.mean(confidence[mask])))
+            bin_counts.append(int(np.sum(mask)))
+        else:
+            bin_accs.append(0.0)
+            bin_confs.append(0.0)
+            bin_counts.append(0)
 
     # Calculate ECE
-    ece = np.sum(bin_counts * np.abs(bin_accuracies - bin_confidences)) / np.sum(bin_counts)
+    total_samples = sum(bin_counts)
+    if total_samples > 0:
+        ece = sum([(count / total_samples) * abs(acc - conf)
+                   for count, acc, conf in zip(bin_counts, bin_accs, bin_confs)])
+    else:
+        ece = 0.0
 
-    return float(ece)
+    return float(ece), bin_accs, bin_confs, bin_counts
+
+
+def plot_reliability_diagram(bin_accs, bin_confs, bin_counts, dataset_name, ece, save_path):
+    """Plot reliability diagram showing calibration.
+
+    Args:
+        bin_accs: List of accuracies for each bin
+        bin_confs: List of confidences for each bin
+        bin_counts: List of sample counts for each bin
+        dataset_name: Name of the dataset
+        ece: Expected Calibration Error
+        save_path: Path to save the figure
+    """
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # Calculate normalized bin counts
+    total_samples = sum(bin_counts)
+    if total_samples > 0:
+        bin_counts_normalized = [count / total_samples for count in bin_counts]
+    else:
+        bin_counts_normalized = [0.0] * len(bin_counts)
+
+    # Number of bins
+    n_bins = len(bin_accs)
+
+    # Plot histogram of sample distribution
+    ax.bar(range(n_bins), bin_counts_normalized, width=0.8, alpha=0.3, color='b', label='Samples')
+
+    # Plot accuracy and confidence
+    ax.plot([0, n_bins-1], [0, 1], 'k--', label='Perfect calibration')
+    ax.plot(range(n_bins), bin_accs, 'ro-', label='Accuracy')
+    ax.plot(range(n_bins), bin_confs, 'bs-', label='Confidence')
+
+    # Set labels and ticks
+    ax.set_xlim([-0.5, n_bins-0.5])
+    ax.set_ylim([0, 1])
+    ax.set_xlabel('Confidence', fontsize=14)
+    ax.set_ylabel('Accuracy / Fraction of samples', fontsize=14)
+    ax.set_title(f"Reliability Diagram - {dataset_name} (ECE: {ece:.4f})", fontsize=16)
+    ax.set_xticks(range(n_bins))
+    ax.set_xticklabels([f"{b:.1f}" for b in np.linspace(0.05, 0.95, n_bins)])
+    ax.legend(loc='lower right')
+
+    # Save figure
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close(fig)
 
 
 def evaluate_model(model_path, dataset, device, args):
-    """Evaluate variational model on dataset with Monte Carlo sampling
+    """Evaluate variational model on dataset with Monte Carlo sampling"""
+    # Extract dataset name from path for visualization titles
+    try:
+        dataset_name = os.path.basename(os.path.dirname(model_path))
+        if dataset_name.endswith("Val"):
+            dataset_name = dataset_name[:-3]
+    except:
+        dataset_name = "Unknown"  # Fallback name
 
-    Args:
-        model_path: Path to saved model
-        dataset: Dataset with precomputed features
-        device: Computation device
-        args: Command line arguments
-
-    Returns:
-        dict: Evaluation results
-    """
     # Load model state
     try:
         if args.debug:
@@ -338,11 +423,6 @@ def evaluate_model(model_path, dataset, device, args):
         uncertainty_reg = config.get('uncertainty_reg', args.uncertainty_reg)
         kl_weight = config.get('kl_weight', 0.1)
         gating_enabled = config.get('gating_enabled', True)
-
-        if args.debug:
-            print(f"Model config: task_vectors={num_task_vectors}, blockwise={blockwise}, "
-                  f"base_threshold={base_threshold}, beta={beta}, "
-                  f"kl_weight={kl_weight}, gating_enabled={gating_enabled}")
     else:
         # No config found, use command line arguments
         if args.debug:
@@ -355,7 +435,7 @@ def evaluate_model(model_path, dataset, device, args):
         else:
             features = batch[0]
         feature_dim = features.shape[1]
-        model_name = args.model  # Default to model name from args
+        model_name = args.model
 
         # Use provided arguments
         num_task_vectors = args.num_task_vectors
@@ -502,22 +582,19 @@ def evaluate_model(model_path, dataset, device, args):
     all_predictions = []
     all_labels = []
     all_probs = []
-    epistemic_uncertainties = []
-    aleatoric_uncertainties = []
-    predictive_entropies = []
     class_correct = defaultdict(int)
     class_total = defaultdict(int)
 
     # Get uncertainty analysis directory
     if args.save_uncertainty:
-        uncertainty_dir = os.path.join(os.path.dirname(model_path), "uncertainty_analysis")
+        uncertainty_dir = os.path.join(os.path.dirname(model_path), "reliability_diagrams")
         os.makedirs(uncertainty_dir, exist_ok=True)
     else:
         uncertainty_dir = None
 
     # Evaluate with Monte Carlo sampling
     with torch.no_grad():
-        for batch_idx, batch in enumerate(dataset.test_loader):
+        for batch in dataset.test_loader:
             if isinstance(batch, dict):
                 features = batch["features"].to(device)
                 labels = batch["labels"].to(device)
@@ -534,9 +611,6 @@ def evaluate_model(model_path, dataset, device, args):
             # Get statistics
             predictions = prediction_stats["predictions"]
             mean_probs = prediction_stats["mean_probs"]
-            epistemic_uncertainty = prediction_stats["epistemic_uncertainty"]
-            aleatoric_uncertainty = prediction_stats["aleatoric_uncertainty"]
-            predictive_entropy = prediction_stats["predictive_entropy"]
 
             # Update metrics
             batch_size = labels.size(0)
@@ -557,188 +631,77 @@ def evaluate_model(model_path, dataset, device, args):
             all_predictions.append(predictions)
             all_labels.append(labels.cpu())
             all_probs.append(mean_probs)
-            epistemic_uncertainties.append(epistemic_uncertainty)
-            aleatoric_uncertainties.append(aleatoric_uncertainty)
-            predictive_entropies.append(predictive_entropy)
-
-            # For first few batches, save posterior visualization
-            if batch_idx < 3 and args.save_uncertainty and args.detailed_analysis:
-                # Save sample batch for posterior visualization
-                sample_size = min(10, features.size(0))
-                posterior_stats = model.get_posterior_stats(features[:sample_size])
-
-                # Create figures
-                figs = visualize_posterior_distribution(
-                    posterior_stats,
-                    num_display=5,
-                    num_task_vectors=model.num_task_vectors,
-                    blockwise=model.blockwise
-                )
-
-                # Save figures
-                for i, fig in enumerate(figs):
-                    fig_path = os.path.join(uncertainty_dir, f"batch{batch_idx}_sample{i}_posterior.png")
-                    fig.savefig(fig_path, dpi=300)
-                    plt.close(fig)
 
     # Calculate overall accuracy
-    accuracy = all_correct / all_total
+    accuracy = all_correct / all_total if all_total > 0 else 0.0
 
     # Combine prediction data
     all_predictions = torch.cat(all_predictions)
     all_labels = torch.cat(all_labels)
     all_probs = torch.cat(all_probs)
-    epistemic_uncertainties = torch.cat(epistemic_uncertainties)
-    aleatoric_uncertainties = torch.cat(aleatoric_uncertainties)
-    predictive_entropies = torch.cat(predictive_entropies)
 
     # Calculate per-class accuracy
     per_class_acc = {}
-    per_class_report = []
-
     for cls_idx in range(len(dataset.classnames)):
         cls_name = dataset.classnames[cls_idx]
         if class_total[cls_idx] > 0:
             cls_acc = class_correct[cls_idx] / class_total[cls_idx]
             per_class_acc[cls_name] = float(cls_acc)
-            per_class_report.append({
-                'class_id': cls_idx,
-                'class_name': cls_name,
-                'accuracy': float(cls_acc),
-                'correct': class_correct[cls_idx],
-                'total': class_total[cls_idx]
-            })
 
-    # Calculate expected calibration error using our custom function
-    ece = expected_calibration_error(all_labels.numpy(), all_probs.numpy())
+    # Calculate ECE and plot reliability diagram
+    ece, bin_accs, bin_confs, bin_counts = expected_calibration_error(
+        all_labels.cpu().numpy(),
+        all_probs.cpu().numpy(),
+        n_bins=10
+    )
 
-    # Calculate uncertainty metrics
-    uncertainty_metrics = {
-        "avg_epistemic_uncertainty": float(epistemic_uncertainties.mean().item()),
-        "avg_aleatoric_uncertainty": float(aleatoric_uncertainties.mean().item()),
-        "avg_predictive_entropy": float(predictive_entropies.mean().item()),
-        "ece": float(ece),
-    }
-
-    # Separate correct and incorrect predictions for uncertainty analysis
-    correct_mask = (all_predictions == all_labels.numpy()).numpy()  # Convert to numpy directly
-    if np.any(correct_mask) and np.any(~correct_mask):
-        uncertainty_metrics.update({
-            "correct_epistemic_uncertainty": float(epistemic_uncertainties[correct_mask].mean().item()),
-            "incorrect_epistemic_uncertainty": float(epistemic_uncertainties[~correct_mask].mean().item()),
-            "correct_aleatoric_uncertainty": float(aleatoric_uncertainties[correct_mask].mean().item()),
-            "incorrect_aleatoric_uncertainty": float(aleatoric_uncertainties[~correct_mask].mean().item()),
-            "correct_predictive_entropy": float(predictive_entropies[correct_mask].mean().item()),
-            "incorrect_predictive_entropy": float(predictive_entropies[~correct_mask].mean().item()),
-        })
-
-        # Add uncertainty ratio (higher is better for error detection)
-        if uncertainty_metrics["correct_epistemic_uncertainty"] > 0:
-            uncertainty_metrics["uncertainty_ratio"] = float(
-                uncertainty_metrics["incorrect_epistemic_uncertainty"] /
-                uncertainty_metrics["correct_epistemic_uncertainty"]
+    # Create reliability diagram
+    if args.save_uncertainty:
+        try:
+            reliability_path = os.path.join(uncertainty_dir, f"{dataset_name}_reliability_diagram.png")
+            plot_reliability_diagram(
+                bin_accs, bin_confs, bin_counts,
+                dataset_name, ece, reliability_path
             )
+            print(f"Saved reliability diagram to {reliability_path}")
+        except Exception as e:
+            print(f"Error generating reliability diagram: {e}")
+            if args.debug:
+                traceback.print_exc()
 
     # Get gating and posterior statistics
     if hasattr(model, 'get_gating_stats'):
-        gating_stats = model.get_gating_stats()
+        gating_stats_raw = model.get_gating_stats()
+        # Convert each value to Python type
+        gating_stats = {k: float(v) if isinstance(v, (int, float, np.integer, np.floating)) else v
+                        for k, v in gating_stats_raw.items()}
     else:
         gating_stats = {}
 
-    # Save uncertainty visualizations
-    if args.save_uncertainty:
-        # Custom reliability diagram for multi-class
-        fig, ax = plt.subplots(figsize=(10, 8))
-
-        # Get predictions and confidences
-        conf = np.max(all_probs.numpy(), axis=1)
-        pred_class = np.argmax(all_probs.numpy(), axis=1)
-        true_labels = all_labels.numpy()
-        accuracy = (pred_class == true_labels)
-
-        # Create bins
-        n_bins = 10
-        bin_boundaries = np.linspace(0, 1, n_bins + 1)
-        bin_indices = np.digitize(conf, bin_boundaries) - 1
-        bin_indices = np.clip(bin_indices, 0, n_bins - 1)
-
-        # Calculate bin statistics
-        bin_acc = np.zeros(n_bins)
-        bin_conf = np.zeros(n_bins)
-        bin_counts = np.zeros(n_bins)
-
-        for i in range(n_bins):
-            mask = (bin_indices == i)
-            if np.any(mask):
-                bin_acc[i] = np.mean(accuracy[mask])
-                bin_conf[i] = np.mean(conf[mask])
-                bin_counts[i] = np.sum(mask)
-
-        # Plot reliability diagram
-        ax.bar(range(n_bins), bin_counts / np.sum(bin_counts), width=0.8, alpha=0.3, color='b', label='Samples')
-        ax.set_xticks(range(n_bins))
-        ax.set_xticklabels([f"{b:.1f}" for b in np.linspace(0.05, 0.95, n_bins)])
-
-        ax.plot([0, n_bins-1], [0, 1], 'k--', label='Perfect calibration')
-        ax.plot(range(n_bins), bin_acc, 'ro-', label='Accuracy')
-        ax.plot(range(n_bins), bin_conf, 'bs-', label='Confidence')
-
-        ax.set_xlim([-0.5, n_bins-0.5])
-        ax.set_ylim([0, 1])
-        ax.set_xlabel('Confidence', fontsize=14)
-        ax.set_ylabel('Accuracy / Fraction of samples', fontsize=14)
-        ax.set_title(f"Reliability Diagram - {dataset_name.split()[0]} (ECE: {ece:.4f})", fontsize=16)
-        ax.legend(loc='lower right')
-
-        fig.savefig(os.path.join(uncertainty_dir, "reliability_diagram.png"), dpi=300)
-        plt.close(fig)
-
-        # Uncertainty distributions
-        if np.any(correct_mask) and np.any(~correct_mask):
-            # Epistemic uncertainty distribution
-            fig, ax = plt.subplots(figsize=(10, 6))
-            ax.hist(epistemic_uncertainties[correct_mask].numpy(), bins=20, alpha=0.5, label="Correct")
-            ax.hist(epistemic_uncertainties[~correct_mask].numpy(), bins=20, alpha=0.5, label="Incorrect")
-            ax.set_xlabel("Epistemic Uncertainty")
-            ax.set_ylabel("Count")
-            ax.set_title("Epistemic Uncertainty Distribution by Correctness")
-            ax.legend()
-            fig.savefig(os.path.join(uncertainty_dir, "epistemic_uncertainty_distribution.png"), dpi=300)
-            plt.close(fig)
-
-            # Entropy distribution
-            fig, ax = plt.subplots(figsize=(10, 6))
-            ax.hist(predictive_entropies[correct_mask].numpy(), bins=20, alpha=0.5, label="Correct")
-            ax.hist(predictive_entropies[~correct_mask].numpy(), bins=20, alpha=0.5, label="Incorrect")
-            ax.set_xlabel("Predictive Entropy")
-            ax.set_ylabel("Count")
-            ax.set_title("Predictive Entropy Distribution by Correctness")
-            ax.legend()
-            fig.savefig(os.path.join(uncertainty_dir, "predictive_entropy_distribution.png"), dpi=300)
-            plt.close(fig)
-
-    # Combine results
+    # Combine results - ensure all values are Python native types
     results = {
-        'accuracy': accuracy,
-        'num_correct': all_correct,
-        'num_samples': all_total,
+        'accuracy': float(accuracy),
+        'num_correct': int(all_correct),
+        'num_samples': int(all_total),
         'per_class_accuracy': per_class_acc,
-        'per_class_report': per_class_report,
-        'uncertainty_metrics': uncertainty_metrics,
+        'ece': float(ece),
+        'reliability_diagram': {
+            'bin_accuracies': bin_accs,
+            'bin_confidences': bin_confs,
+            'bin_counts': bin_counts
+        },
         'gating_stats': gating_stats,
         'config': model_config,
-        'model_path': model_path,
+        'model_path': str(model_path),
         'model_type': 'variational',
         'evaluation_timestamp': datetime.now().isoformat(),
     }
 
+    # Convert any remaining non-standard types
+    results = convert_to_python_types(results)
+
     if args.debug:
         print(f"Evaluation complete. Accuracy: {accuracy * 100:.2f}%, ECE: {ece:.4f}")
-        print(f"Uncertainty metrics: Epistemic = {uncertainty_metrics['avg_epistemic_uncertainty']:.4f}, "
-              f"Aleatoric = {uncertainty_metrics['avg_aleatoric_uncertainty']:.4f}")
-
-        if "uncertainty_ratio" in uncertainty_metrics:
-            print(f"Uncertainty ratio (incorrect/correct): {uncertainty_metrics['uncertainty_ratio']:.4f}")
 
     return results
 
@@ -765,8 +728,7 @@ def main():
     print(f"Model: {args.model}")
     print(f"Using blockwise coefficients: {args.blockwise_coef}")
     print(f"Monte Carlo samples: {args.num_eval_samples}")
-    print(f"Save uncertainty analysis: {args.save_uncertainty}")
-    print(f"Detailed analysis: {args.detailed_analysis}")
+    print(f"Save reliability diagrams: {args.save_uncertainty}")
     print(f"Datasets to evaluate: {args.datasets}")
     print("=" * 30)
 
@@ -822,7 +784,7 @@ def main():
             # Print results
             print(f"Model: {results['config']['model_name']}")
             print(f"Accuracy: {results['accuracy'] * 100:.2f}% ({results['num_correct']}/{results['num_samples']})")
-            print(f"ECE: {results['uncertainty_metrics']['ece']:.4f}")
+            print(f"ECE: {results['ece']:.4f}")
 
             if 'gating_stats' in results and results['gating_stats']:
                 stats = results['gating_stats']
@@ -830,18 +792,13 @@ def main():
                       f"β={stats.get('beta', 0):.4f}, "
                       f"gating ratio={stats.get('gating_ratio', 0) * 100:.1f}%")
 
-            if 'uncertainty_metrics' in results and 'uncertainty_ratio' in results['uncertainty_metrics']:
-                ratio = results['uncertainty_metrics']['uncertainty_ratio']
-                print(f"Uncertainty ratio (incorrect/correct): {ratio:.2f}")
-
             # Add to results
             all_results[dataset_name] = results
             summary_results.append({
                 'dataset': dataset_name,
-                'accuracy': results['accuracy'],
-                'ece': results['uncertainty_metrics']['ece'],
-                'uncertainty_ratio': results['uncertainty_metrics'].get('uncertainty_ratio', 0),
-                'model': results['config']['model_name']
+                'accuracy': float(results['accuracy']),
+                'ece': float(results['ece']),
+                'model': str(results['config']['model_name'])
             })
 
         except Exception as e:
@@ -854,12 +811,12 @@ def main():
             torch.cuda.empty_cache()
             gc.collect()
 
-    # Calculate average accuracy
+    # Calculate average accuracy and ECE
     if summary_results:
         avg_accuracy = sum(r['accuracy'] for r in summary_results) / len(summary_results)
         avg_ece = sum(r['ece'] for r in summary_results) / len(summary_results)
-        all_results['average_accuracy'] = avg_accuracy
-        all_results['average_ece'] = avg_ece
+        all_results['average_accuracy'] = float(avg_accuracy)
+        all_results['average_ece'] = float(avg_ece)
 
         # Save results with model name in filename
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -868,6 +825,9 @@ def main():
             f"variational_results_{args.model}_{timestamp}.json"
         )
 
+        # Make sure everything is converted to native Python types for JSON serialization
+        all_results = convert_to_python_types(all_results)
+
         with open(results_path, 'w') as f:
             json.dump(all_results, f, indent=4)
 
@@ -875,16 +835,15 @@ def main():
 
         # Print summary table
         print("\n=== Variational Evaluation Summary ===")
-        print(f"{'Dataset':<15} | {'Accuracy':<10} | {'ECE':<8} | {'Unc. Ratio':<10} | {'Model':<12}")
-        print("-" * 65)
+        print(f"{'Dataset':<15} | {'Accuracy':<10} | {'ECE':<8} | {'Model':<12}")
+        print("-" * 50)
 
         for result in sorted(summary_results, key=lambda x: x['dataset']):
-            print(f"{result['dataset']:<15} | {result['accuracy'] * 100:>8.2f}% | {result['ece']:>6.4f} | "
-                  f"{result['uncertainty_ratio']:>10.2f} | {result['model']:<12}")
+            print(f"{result['dataset']:<15} | {result['accuracy'] * 100:>8.2f}% | {result['ece']:>6.4f} | {result['model']:<12}")
 
-        print("-" * 65)
-        print(f"{'Average':<15} | {avg_accuracy * 100:>8.2f}% | {avg_ece:>6.4f} | {'N/A':>10} | {args.model:<12}")
-        print("=" * 65)
+        print("-" * 50)
+        print(f"{'Average':<15} | {avg_accuracy * 100:>8.2f}% | {avg_ece:>6.4f} | {args.model:<12}")
+        print("=" * 50)
 
 
 if __name__ == "__main__":
