@@ -1,8 +1,9 @@
 """
-Training script for Variational MetaNet using pre-computed features.
+Training script for Spike-and-Slab Variational MetaNet using pre-computed features.
 
-This script provides a training implementation that properly models
-the posterior distribution through variational inference.
+This script provides a training implementation that models
+the posterior distribution through variational inference with
+a Spike-and-Slab prior for sparsity.
 """
 
 import os
@@ -18,7 +19,7 @@ import traceback
 from datetime import datetime
 import math
 
-from src.variational_metanet import VariationalMetaNet
+from src.variational_metanet import SpikeAndSlabMetaNet
 from src.utils import cosine_lr
 from src.datasets.common import maybe_dictionarize
 from src.distributed import cleanup_ddp, distribute_loader, is_main_process, setup_ddp
@@ -35,8 +36,10 @@ args = parse_arguments()
 # Add variational-specific arguments
 args.kl_weight = 0.1  # Weight for KL divergence in ELBO
 args.num_samples = 5  # Number of samples to draw from posterior during training
-args.visualize_posterior = False  # Whether to visualize posterior distributions
-args.variational_gating = True  # Whether to use variational gating mechanism
+args.visualize_posterior = True  # Whether to visualize posterior distributions
+args.prior_pi = 0.5  # Prior inclusion probability
+args.prior_sigma = 1.0  # Prior standard deviation for the slab component
+args.temperature = 0.1  # Temperature for Gumbel-Softmax
 
 
 class PrecomputedFeatureDataset(torch.utils.data.Dataset):
@@ -97,8 +100,6 @@ class PrecomputedFeatureDataset(torch.utils.data.Dataset):
                         if aug_features.shape == self.features.shape and aug_labels.shape == self.labels.shape:
                             self.augmented_features.append(aug_features)
                             self.augmented_labels.append(aug_labels)
-                        else:
-                            print(f"Warning: Augmented version {aug_idx + 1} has mismatched shape, skipping")
                     except Exception as e:
                         print(f"Error loading augmented version {aug_idx + 1}: {e}")
                         if verbose:
@@ -156,7 +157,7 @@ class PrecomputedFeatures:
         if not os.path.exists(feature_dir):
             raise FileNotFoundError(f"Feature directory not found: {feature_dir}")
 
-        # Define file paths - direct and simple
+        # Define file paths
         train_features_path = os.path.join(feature_dir, "train_features.pt")
         train_labels_path = os.path.join(feature_dir, "train_labels.pt")
         val_features_path = os.path.join(feature_dir, "val_features.pt")
@@ -166,10 +167,11 @@ class PrecomputedFeatures:
         if not os.path.exists(train_features_path):
             raise FileNotFoundError(f"Train features not found at {train_features_path}")
 
-        # Find augmented versions
+        # Find augmented versions without verbose output
         augmentation_paths = []
         aug_idx = 1
 
+        # Count available augmentation files
         while True:
             aug_feat_path = os.path.join(feature_dir, f"train_features_aug{aug_idx}.pt")
             aug_label_path = os.path.join(feature_dir, f"train_labels_aug{aug_idx}.pt")
@@ -268,7 +270,7 @@ def evaluate_model(model, classifier, dataset, device, num_eval_samples=10, save
 
     Parameters:
     ----------
-    model: VariationalMetaNet
+    model: SpikeAndSlabMetaNet
         The model to evaluate
     classifier: nn.Module
         Classification head
@@ -297,6 +299,7 @@ def evaluate_model(model, classifier, dataset, device, num_eval_samples=10, save
     all_predictions = []
     all_labels = []
     all_uncertainties = []
+    all_sparsity_ratios = []
 
     # Get proper classnames
     classnames = dataset.classnames if hasattr(dataset, 'classnames') else None
@@ -312,9 +315,10 @@ def evaluate_model(model, classifier, dataset, device, num_eval_samples=10, save
                 features, classifier, num_samples=num_eval_samples
             )
 
-            # Get epistemic uncertainty for analysis
+            # Get epistemic uncertainty and sparsity ratio for analysis
             epistemic_uncertainty = prediction_stats["epistemic_uncertainty"]
             predictions = prediction_stats["predictions"]
+            sparsity_ratio = prediction_stats.get("sparsity_ratio", 0.0)
 
             # Compute accuracy
             batch_size = labels.size(0)
@@ -325,6 +329,7 @@ def evaluate_model(model, classifier, dataset, device, num_eval_samples=10, save
             all_predictions.append(predictions)
             all_labels.append(labels.cpu())
             all_uncertainties.append(epistemic_uncertainty)
+            all_sparsity_ratios.append(sparsity_ratio)
 
     # Compute accuracy
     accuracy = total_correct / total_samples
@@ -339,12 +344,14 @@ def evaluate_model(model, classifier, dataset, device, num_eval_samples=10, save
         "accuracy": accuracy,
         "num_correct": total_correct,
         "num_samples": total_samples,
+        "avg_epistemic_uncertainty": all_uncertainties.mean().item(),
+        "avg_sparsity_ratio": np.mean(all_sparsity_ratios),
     }
 
-    # Get gating statistics if available
-    if hasattr(model, 'get_gating_stats'):
-        gating_stats = model.get_gating_stats()
-        metrics.update(gating_stats)
+    # Get sparsity statistics
+    if hasattr(model, 'get_sparsity_stats'):
+        sparsity_stats = model.get_sparsity_stats()
+        metrics.update(sparsity_stats)
 
     # Save uncertainty analysis if requested
     if save_uncertainty and save_dir is not None:
@@ -391,11 +398,26 @@ def evaluate_model(model, classifier, dataset, device, num_eval_samples=10, save
             # Add uncertainty metrics to results
             metrics.update({f"uncertainty_{k}": v for k, v in uncertainty_metrics.items()})
 
+            # Create sparsity visualization
+            try:
+                if "binary_indicators" in prediction_stats:
+                    binary_indicators = prediction_stats["binary_indicators"]
+                    plt.figure(figsize=(10, 6))
+                    plt.imshow(binary_indicators[:20].cpu().numpy(), aspect='auto', cmap='Blues')
+                    plt.colorbar(label="Inclusion Probability")
+                    plt.xlabel("Task Vector (or Blocks)")
+                    plt.ylabel("Sample Index")
+                    plt.title(f"Coefficient Inclusion Probabilities (Sparsity={sparsity_stats['sparsity_ratio']:.2f})")
+                    plt.savefig(os.path.join(save_dir, "inclusion_probabilities.png"), dpi=300)
+                    plt.close()
+            except Exception as e:
+                print(f"Error creating sparsity visualization: {e}")
+
     return metrics
 
 
 def train_with_variational(rank, args):
-    """Main training function with variational inference"""
+    """Main training function with Spike-and-Slab variational inference"""
     args.rank = rank
 
     # Initialize distributed setup
@@ -426,12 +448,12 @@ def train_with_variational(rank, args):
     if rank == 0:
         print(f"\n=== Training Configuration ===")
         print(f"Model: {args.model}")
-        print(f"Using Variational MetaNet: True")
+        print(f"Using Spike-and-Slab Variational MetaNet")
         print(f"Using blockwise coefficients: {args.blockwise_coef}")
-        print(f"Using gating mechanism: {args.variational_gating}")
-        print(f"Base threshold (αT): {args.base_threshold:.4f}")
-        print(f"Beta (β): {args.beta:.4f}")
+        print(f"Prior π (inclusion probability): {args.prior_pi:.2f}")
+        print(f"Prior σ (slab std): {args.prior_sigma:.2f}")
         print(f"KL weight: {args.kl_weight:.4f}")
+        print(f"Temperature: {args.temperature:.4f}")
         print(f"MC Samples during training: {args.num_samples}")
         print(f"Using augmentation: {args.use_augmentation}")
         print(f"Batch size: {args.batch_size}")
@@ -443,7 +465,7 @@ def train_with_variational(rank, args):
 
     for dataset_name in datasets_to_process:
         if is_main_process():
-            print(f"=== Training on {dataset_name} with Variational MetaNet ===")
+            print(f"=== Training on {dataset_name} with Spike-and-Slab Variational MetaNet ===")
 
         # Setup save directory for this dataset (include model name in path)
         save_dir = os.path.join(model_save_dir, dataset_name + "Val")
@@ -477,24 +499,19 @@ def train_with_variational(rank, args):
             if is_main_process():
                 print(f"Feature dimension: {feature_dim}")
 
-            # Create variational metanet model
-            model = VariationalMetaNet(
+            # Create Spike-and-Slab variational metanet model
+            model = SpikeAndSlabMetaNet(
                 feature_dim=feature_dim,
                 task_vectors=args.num_task_vectors,
                 blockwise=args.blockwise_coef,
-                base_threshold=args.base_threshold,
-                beta=args.beta,
-                uncertainty_reg=args.uncertainty_reg,
-                reg_coefficient=args.reg_coefficient if hasattr(args, 'reg_coefficient') else 0.001,
-                margin_weight=args.margin_weight if hasattr(args, 'margin_weight') else 0.0001,
                 kl_weight=args.kl_weight,
                 num_samples=args.num_samples,
-                gating_enabled=args.variational_gating
+                prior_pi=args.prior_pi,
+                prior_sigma=args.prior_sigma,
+                temperature=args.temperature
             )
             if is_main_process():
-                print(
-                    f"Created VariationalMetaNet with {'blockwise' if args.blockwise_coef else 'global'} coefficients")
-                print(f"Gating enabled: {args.variational_gating}")
+                print(f"Created SpikeAndSlabMetaNet with {'blockwise' if args.blockwise_coef else 'global'} coefficients")
                 print(f"Using {args.num_samples} MC samples during training")
 
             model = model.to(rank)
@@ -521,7 +538,7 @@ def train_with_variational(rank, args):
             # Group parameters to allow different learning rates
             mean_net_params = []
             logvar_net_params = []
-            gating_log_params = []
+            logit_net_params = []
             other_params = []
 
             # Separate parameters by type
@@ -530,8 +547,8 @@ def train_with_variational(rank, args):
                     mean_net_params.append(param)
                 elif 'logvar_net' in name:
                     logvar_net_params.append(param)
-                elif 'log_beta' in name or 'log_base_threshold' in name:
-                    gating_log_params.append(param)
+                elif 'logit_net' in name:
+                    logit_net_params.append(param)
                 else:
                     other_params.append(param)
 
@@ -542,7 +559,7 @@ def train_with_variational(rank, args):
             param_groups = [
                 {'params': mean_net_params, 'lr': args.lr * 2.0, 'weight_decay': 0.001},  # Higher LR for mean
                 {'params': logvar_net_params, 'lr': args.lr * 1.0, 'weight_decay': 0.0005},  # Lower for variance
-                {'params': gating_log_params, 'lr': args.lr * args.lr_multiplier, 'weight_decay': args.weight_decay},
+                {'params': logit_net_params, 'lr': args.lr * 3.0, 'weight_decay': 0.001},  # Higher for logit net
                 {'params': other_params, 'lr': args.lr, 'weight_decay': args.wd}
             ]
 
@@ -565,15 +582,9 @@ def train_with_variational(rank, args):
             # Training monitoring
             train_losses = []
             kl_losses = []
-            reg_losses = []
             val_accuracies = []
-            gating_stats = []
+            sparsity_stats = []
             uncertainty_metrics = []
-            predictive_variances = []
-            base_threshold_values = []
-            beta_values = []
-            log_base_threshold_values = []
-            log_beta_values = []
             best_acc = 0.0
             best_model_state = None
 
@@ -584,7 +595,6 @@ def train_with_variational(rank, args):
 
                 epoch_loss = 0.0
                 epoch_kl_loss = 0.0
-                epoch_reg_loss = 0.0
                 batch_count = 0
 
                 if is_main_process():
@@ -607,12 +617,11 @@ def train_with_variational(rank, args):
                             # Task loss (negative log-likelihood)
                             task_loss = loss_fn(logits, labels)
 
-                            # Variational regularization losses (KL + uncertainty)
+                            # Variational KL divergence
                             kl_loss = ddp_model.module.kl_divergence_loss()
-                            reg_loss = ddp_model.module.uncertainty_regularization_loss()
 
                             # Total loss for ELBO optimization
-                            total_loss = task_loss + kl_loss + reg_loss
+                            total_loss = task_loss + kl_loss
 
                         # Backward pass with gradient scaling
                         scaler.scale(total_loss).backward()
@@ -626,48 +635,44 @@ def train_with_variational(rank, args):
                         # Record stats
                         task_loss_cpu = task_loss.item()
                         kl_loss_cpu = kl_loss.item()
-                        reg_loss_cpu = reg_loss.item()
                         batch_count += 1
                         epoch_loss += task_loss_cpu
                         epoch_kl_loss += kl_loss_cpu
-                        epoch_reg_loss += reg_loss_cpu
 
                         if is_main_process():
                             train_losses.append(task_loss_cpu)
                             kl_losses.append(kl_loss_cpu)
-                            reg_losses.append(reg_loss_cpu)
 
-                            # Get current gating and uncertainty parameters
-                            stats = ddp_model.module.get_gating_stats()
-                            if stats:
-                                gating_stats.append(stats)
-
-                                # Extract key parameters for tracking
-                                base_threshold_values.append(stats["base_threshold"])
-                                beta_values.append(stats["beta"])
-                                log_base_threshold_values.append(stats["log_base_threshold"])
-                                log_beta_values.append(stats["log_beta"])
-                                predictive_variances.append(stats["predictive_variance"])
+                            # Get current sparsity statistics
+                            if hasattr(ddp_model.module, 'get_sparsity_stats'):
+                                stats = ddp_model.module.get_sparsity_stats()
+                                if stats:
+                                    sparsity_stats.append(stats)
 
                         # Print progress (with reduced frequency)
                         if i % print_every == 0 and is_main_process():
-                            # Get current parameters
-                            if is_main_process() and stats:
-                                current_base_threshold = stats["base_threshold"]
-                                current_beta = stats["beta"]
-                                gating_ratio = stats.get("gating_ratio", 0.0)
-                                pred_var = stats.get("predictive_variance", 0.0)
+                            # Get current sparsity statistics if available
+                            if is_main_process() and hasattr(ddp_model.module, 'get_sparsity_stats'):
+                                stats = ddp_model.module.get_sparsity_stats()
+                                if stats:
+                                    sparsity_ratio = stats.get("sparsity_ratio", 0.0)
+                                    posterior_inclusion = stats.get("posterior_inclusion_prob", 0.0)
 
-                                # Detailed output
-                                print(f"  Batch {i:4d}/{num_batches:4d} | Task: {task_loss_cpu:.4f} | "
-                                      f"KL: {kl_loss_cpu:.4f} | Reg: {reg_loss_cpu:.4f} | "
-                                      f"αT: {current_base_threshold:.4f} | β: {current_beta:.4f} | "
-                                      f"Gate: {gating_ratio * 100:.1f}% | Var: {pred_var:.4f} | "
-                                      f"t: {time.time() - start_time:.2f}s")
+                                    # Detailed output
+                                    print(f"  Batch {i:4d}/{num_batches:4d} | Task: {task_loss_cpu:.4f} | "
+                                          f"KL: {kl_loss_cpu:.4f} | "
+                                          f"Sparsity: {sparsity_ratio*100:.1f}% | "
+                                          f"Include Prob: {posterior_inclusion:.3f} | "
+                                          f"t: {time.time() - start_time:.2f}s")
+                                else:
+                                    # Simple output
+                                    print(f"  Batch {i:4d}/{num_batches:4d} | Task: {task_loss_cpu:.4f} | "
+                                          f"KL: {kl_loss_cpu:.4f} | "
+                                          f"t: {time.time() - start_time:.2f}s")
                             else:
                                 # Simple output
                                 print(f"  Batch {i:4d}/{num_batches:4d} | Task: {task_loss_cpu:.4f} | "
-                                      f"KL: {kl_loss_cpu:.4f} | Reg: {reg_loss_cpu:.4f} | "
+                                      f"KL: {kl_loss_cpu:.4f} | "
                                       f"t: {time.time() - start_time:.2f}s")
 
                     except Exception as e:
@@ -680,26 +685,25 @@ def train_with_variational(rank, args):
                 # Record epoch stats
                 avg_epoch_loss = epoch_loss / batch_count if batch_count > 0 else 0
                 avg_epoch_kl_loss = epoch_kl_loss / batch_count if batch_count > 0 else 0
-                avg_epoch_reg_loss = epoch_reg_loss / batch_count if batch_count > 0 else 0
 
                 # Print epoch summary
                 if is_main_process():
-                    if gating_stats:
-                        latest_stats = gating_stats[-1]
+                    if sparsity_stats:
+                        latest_stats = sparsity_stats[-1]
+                        sparsity_ratio = latest_stats.get("sparsity_ratio", 0.0)
+                        posterior_inclusion = latest_stats.get("posterior_inclusion_prob", 0.0)
+
                         print(f"  Summary: Task: {avg_epoch_loss:.4f} | KL: {avg_epoch_kl_loss:.4f} | "
-                              f"Reg: {avg_epoch_reg_loss:.4f} | αT: {latest_stats['base_threshold']:.4f} | "
-                              f"β: {latest_stats['beta']:.4f} | Gate: {latest_stats['gating_ratio'] * 100:.1f}% | "
-                              f"Var: {latest_stats['predictive_variance']:.4f}")
+                              f"Sparsity: {sparsity_ratio*100:.1f}% | Include Prob: {posterior_inclusion:.3f}")
                     else:
-                        print(f"  Summary: Task: {avg_epoch_loss:.4f} | KL: {avg_epoch_kl_loss:.4f} | "
-                              f"Reg: {avg_epoch_reg_loss:.4f}")
+                        print(f"  Summary: Task: {avg_epoch_loss:.4f} | KL: {avg_epoch_kl_loss:.4f}")
 
                 # Evaluate on validation set
                 if is_main_process():
                     print(f"Epoch {epoch + 1}/{args.epochs} - Validation")
 
                     # Create visualization directory for this epoch
-                    if args.visualize_posterior:
+                    if args.visualize_posterior and epoch % 5 == 0:  # Visualize every 5 epochs
                         vis_dir = os.path.join(save_dir, f"posterior_epoch_{epoch + 1}")
                         os.makedirs(vis_dir, exist_ok=True)
                     else:
@@ -721,18 +725,11 @@ def train_with_variational(rank, args):
                     uncertainty_metrics.append(eval_results)
 
                     # Print evaluation results
-                    print(
-                        f"  Accuracy: {val_acc * 100:.2f}% ({eval_results['num_correct']}/{eval_results['num_samples']})")
+                    sparsity_ratio = eval_results.get("sparsity_ratio", 0.0)
 
-                    # Print uncertainty metrics if available
-                    if "uncertainty_ece" in eval_results:
-                        print(f"  ECE: {eval_results['uncertainty_ece']:.4f} | "
-                              f"Entropy: {eval_results['uncertainty_avg_predictive_entropy']:.4f}")
-
-                        if "uncertainty_correct_epistemic_uncertainty" in eval_results:
-                            print(f"  Correct vs. Incorrect Uncertainty: "
-                                  f"{eval_results['uncertainty_correct_epistemic_uncertainty']:.4f} vs. "
-                                  f"{eval_results['uncertainty_incorrect_epistemic_uncertainty']:.4f}")
+                    print(f"  Accuracy: {val_acc * 100:.2f}% ({eval_results['num_correct']}/{eval_results['num_samples']})")
+                    print(f"  Sparsity ratio: {sparsity_ratio * 100:.1f}%")
+                    print(f"  Avg epistemic uncertainty: {eval_results.get('avg_epistemic_uncertainty', 0.0):.4f}")
 
                     # Save best model
                     if val_acc > best_acc:
@@ -743,16 +740,13 @@ def train_with_variational(rank, args):
                             'feature_dim': feature_dim,
                             'num_task_vectors': args.num_task_vectors,
                             'blockwise': args.blockwise_coef,
-                            'base_threshold': eval_results.get("base_threshold", args.base_threshold),
-                            'beta': eval_results.get("beta", args.beta),
-                            'log_base_threshold': eval_results.get("log_base_threshold", 0.0),
-                            'log_beta': eval_results.get("log_beta", 0.0),
-                            'uncertainty_reg': args.uncertainty_reg,
                             'kl_weight': args.kl_weight,
                             'model_name': args.model,
                             'use_augmentation': args.use_augmentation,
-                            'gating_enabled': args.variational_gating,
-                            'num_samples': args.num_samples,
+                            'prior_pi': args.prior_pi,
+                            'prior_sigma': args.prior_sigma,
+                            'temperature': args.temperature,
+                            'posterior_sparsity': sparsity_ratio,
                             'variational': True  # Mark as variational model
                         }
 
@@ -769,7 +763,7 @@ def train_with_variational(rank, args):
             # Save results
             if is_main_process():
                 # Save best model
-                best_model_path = os.path.join(save_dir, "best_variational_model.pt")
+                best_model_path = os.path.join(save_dir, "best_spike_and_slab_model.pt")
                 print(f"Saving best model to {best_model_path}")
                 torch.save(best_model_state, best_model_path)
 
@@ -780,30 +774,24 @@ def train_with_variational(rank, args):
                 history = {
                     'train_losses': train_losses,
                     'kl_losses': kl_losses,
-                    'reg_losses': reg_losses,
                     'val_accuracies': val_accuracies,
-                    'gating_stats': [
+                    'sparsity_stats': [
                         {k: (float(v) if isinstance(v, (int, float)) else v) for k, v in stats.items()}
-                        for stats in gating_stats
+                        for stats in sparsity_stats
                     ],
                     'uncertainty_metrics': [
                         {k: (float(v) if isinstance(v, (int, float)) else v) for k, v in metrics.items()}
                         for metrics in uncertainty_metrics
                     ],
-                    'predictive_variances': predictive_variances,
-                    'base_threshold_values': base_threshold_values,
-                    'beta_values': beta_values,
-                    'log_base_threshold_values': log_base_threshold_values,
-                    'log_beta_values': log_beta_values,
                     'best_acc': float(best_acc),
                     'config': config if 'config' in locals() else {},
                     'use_augmentation': args.use_augmentation,
-                    'gating_enabled': args.variational_gating,
-                    'num_samples': args.num_samples,
-                    'kl_weight': args.kl_weight
+                    'prior_pi': float(args.prior_pi),
+                    'prior_sigma': float(args.prior_sigma),
+                    'temperature': float(args.temperature)
                 }
 
-                history_path = os.path.join(save_dir, "variational_training_history.json")
+                history_path = os.path.join(save_dir, "spike_and_slab_training_history.json")
 
                 with open(history_path, 'w') as f:
                     # Convert numpy values to Python types for JSON serialization
@@ -815,27 +803,22 @@ def train_with_variational(rank, args):
 
                 # Create plots for training progress
                 # -- Loss curves
-                fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 15), sharex=True)
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
 
                 # Task loss
                 ax1.plot(train_losses, 'r-', linewidth=1.5)
                 ax1.set_ylabel('Task Loss', fontsize=14)
-                ax1.set_title(f'Training Losses for {dataset_name} - Variational MetaNet', fontsize=16)
+                ax1.set_title(f'Training Losses for {dataset_name} - Spike-and-Slab MetaNet', fontsize=16)
                 ax1.grid(True, alpha=0.7)
 
                 # KL loss
                 ax2.plot(kl_losses, 'b-', linewidth=1.5)
+                ax2.set_xlabel('Iterations', fontsize=14)
                 ax2.set_ylabel('KL Loss', fontsize=14)
                 ax2.grid(True, alpha=0.7)
 
-                # Regularization loss
-                ax3.plot(reg_losses, 'g-', linewidth=1.5)
-                ax3.set_xlabel('Iterations', fontsize=14)
-                ax3.set_ylabel('Regularization Loss', fontsize=14)
-                ax3.grid(True, alpha=0.7)
-
                 plt.tight_layout()
-                plt.savefig(os.path.join(plot_dir, f'{dataset_name}_variational_loss_curves.png'), dpi=300)
+                plt.savefig(os.path.join(plot_dir, f'{dataset_name}_spike_and_slab_loss_curves.png'), dpi=300)
                 plt.close()
 
                 # -- Validation accuracy
@@ -846,7 +829,7 @@ def train_with_variational(rank, args):
                         linewidth=2, markersize=8)
                 ax.set_xlabel('Epochs', fontsize=14)
                 ax.set_ylabel('Accuracy (%)', fontsize=14)
-                ax.set_title(f'Validation Accuracy for {dataset_name} - Variational MetaNet', fontsize=16)
+                ax.set_title(f'Validation Accuracy for {dataset_name} - Spike-and-Slab MetaNet', fontsize=16)
                 ax.grid(True, alpha=0.7)
 
                 # Add annotation for best accuracy
@@ -859,65 +842,52 @@ def train_with_variational(rank, args):
                             fontsize=12)
 
                 plt.tight_layout()
-                plt.savefig(os.path.join(plot_dir, f'{dataset_name}_variational_accuracy.png'), dpi=300)
+                plt.savefig(os.path.join(plot_dir, f'{dataset_name}_spike_and_slab_accuracy.png'), dpi=300)
                 plt.close()
 
-                # -- Uncertainty visualization
-                if predictive_variances:
+                # -- Sparsity visualization
+                if sparsity_stats:
+                    # Create figure for sparsity evolution
                     fig, ax = plt.subplots(figsize=(12, 6))
-                    ax.plot(predictive_variances, 'k-', linewidth=1.5)
+
+                    # Extract sparsity ratio over time
+                    sparsity_values = [s.get('sparsity_ratio', 0.0) * 100 for s in sparsity_stats]
+                    inclusion_probs = [s.get('posterior_inclusion_prob', 0.0) for s in sparsity_stats]
+
+                    # Downsample if there are too many points
+                    if len(sparsity_values) > 1000:
+                        stride = len(sparsity_values) // 1000
+                        sparsity_values = sparsity_values[::stride]
+                        inclusion_probs = inclusion_probs[::stride]
+
+                    # Plot sparsity evolution
+                    ax.plot(sparsity_values, 'r-', linewidth=1.5, label='Sparsity Ratio (%)')
+                    ax.set_ylabel('Sparsity Ratio (%)', fontsize=14, color='red')
+                    ax.tick_params(axis='y', labelcolor='red')
+
+                    # Create twin axis for inclusion probability
+                    ax2 = ax.twinx()
+                    ax2.plot(inclusion_probs, 'b-', linewidth=1.5, label='Inclusion Probability')
+                    ax2.set_ylabel('Inclusion Probability', fontsize=14, color='blue')
+                    ax2.tick_params(axis='y', labelcolor='blue')
+
                     ax.set_xlabel('Iterations', fontsize=14)
-                    ax.set_ylabel('Average Predictive Variance', fontsize=14)
-                    ax.set_title(f'Posterior Variance Evolution for {dataset_name}', fontsize=16)
-                    ax.grid(True, alpha=0.7)
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(plot_dir, f'{dataset_name}_predictive_variance.png'), dpi=300)
-                    plt.close()
+                    ax.set_title(f'Sparsity Evolution for {dataset_name}', fontsize=16)
+                    ax.grid(True, alpha=0.3)
 
-                # -- Parameter evolution (if gating enabled)
-                if args.variational_gating and base_threshold_values and beta_values:
-                    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-
-                    # Plot actual parameters
-                    ax1.plot(epochs_range, base_threshold_values[:len(epochs_range)], 'r-o',
-                             linewidth=2, markersize=8, label='αT')
-                    ax1.plot(epochs_range, beta_values[:len(epochs_range)], 'g-o',
-                             linewidth=2, markersize=8, label='β')
-                    ax1.set_ylabel('Parameter Value', fontsize=14)
-                    ax1.set_title(f'Gating Parameters Evolution for {dataset_name} - Variational MetaNet', fontsize=16)
-                    ax1.legend(fontsize=12)
-                    ax1.grid(True, alpha=0.7)
-
-                    # Add annotations for final values
-                    ax1.annotate(f'Final: {base_threshold_values[len(epochs_range) - 1]:.4f}',
-                                 xy=(len(epochs_range), base_threshold_values[len(epochs_range) - 1]),
-                                 xytext=(len(epochs_range) - 3, base_threshold_values[len(epochs_range) - 1] + 0.02),
-                                 arrowprops=dict(facecolor='red', shrink=0.05, width=1.5),
-                                 fontsize=10, color='red')
-
-                    ax1.annotate(f'Final: {beta_values[len(epochs_range) - 1]:.4f}',
-                                 xy=(len(epochs_range), beta_values[len(epochs_range) - 1]),
-                                 xytext=(len(epochs_range) - 3, beta_values[len(epochs_range) - 1] - 0.05),
-                                 arrowprops=dict(facecolor='green', shrink=0.05, width=1.5),
-                                 fontsize=10, color='green')
-
-                    # Plot log parameters
-                    ax2.plot(epochs_range, log_base_threshold_values[:len(epochs_range)], 'r--o',
-                             linewidth=2, markersize=8, label='log(αT)')
-                    ax2.plot(epochs_range, log_beta_values[:len(epochs_range)], 'g--o',
-                             linewidth=2, markersize=8, label='log(β)')
-                    ax2.set_xlabel('Epochs', fontsize=14)
-                    ax2.set_ylabel('Log Parameter Value', fontsize=14)
-                    ax2.set_title(f'Log Gating Parameters Evolution for {dataset_name}', fontsize=16)
-                    ax2.legend(fontsize=12)
-                    ax2.grid(True, alpha=0.7)
+                    # Create combined legend
+                    lines1, labels1 = ax.get_legend_handles_labels()
+                    lines2, labels2 = ax2.get_legend_handles_labels()
+                    ax.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
 
                     plt.tight_layout()
-                    plt.savefig(os.path.join(plot_dir, f'{dataset_name}_variational_parameter_evolution.png'), dpi=300)
+                    plt.savefig(os.path.join(plot_dir, f'{dataset_name}_sparsity_evolution.png'), dpi=300)
                     plt.close()
 
-                print(
-                    f"Training completed for {dataset_name} with Variational MetaNet. Best accuracy: {best_acc * 100:.2f}%")
+                print(f"Training completed for {dataset_name} with Spike-and-Slab MetaNet. Best accuracy: {best_acc * 100:.2f}%")
+                if sparsity_stats:
+                    final_sparsity = sparsity_stats[-1].get('sparsity_ratio', 0.0)
+                    print(f"Final sparsity ratio: {final_sparsity * 100:.1f}%")
 
         except Exception as e:
             if is_main_process():

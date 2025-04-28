@@ -1,9 +1,9 @@
 """
-Variational MetaNet implementation for precomputed features.
+Spike-and-Slab Variational MetaNet implementation for precomputed features.
 
 This module implements a Bayesian approach to task vector combination using
-variational inference. It models the uncertainty in composition coefficients
-by generating both mean and variance parameters of the posterior distribution.
+variational inference with a Spike-and-Slab prior. It models the uncertainty
+in composition coefficients using amortized inference networks.
 """
 
 import torch
@@ -13,22 +13,19 @@ import math
 import numpy as np
 from tqdm import tqdm
 
-class VariationalMetaNet(nn.Module):
-    """MetaNet with proper variational inference for task vector composition."""
+class SpikeAndSlabMetaNet(nn.Module):
+    """MetaNet with Spike-and-Slab variational inference for task vector composition."""
 
     def __init__(self,
                  feature_dim,
                  task_vectors,
                  blockwise=False,
-                 base_threshold=0.05,
-                 beta=1.0,
-                 uncertainty_reg=0.01,
-                 reg_coefficient=0.001,
-                 margin_weight=0.0001,
                  kl_weight=0.1,
                  num_samples=1,
-                 gating_enabled=True):
-        """Initialize VariationalMetaNet.
+                 prior_pi=0.5,
+                 prior_sigma=1.0,
+                 temperature=0.1):
+        """Initialize SpikeAndSlabMetaNet.
 
         Parameters:
         ----------
@@ -38,41 +35,26 @@ class VariationalMetaNet(nn.Module):
             Number of task vectors or list of task vectors
         blockwise: bool
             Whether to use different coefficients for each parameter block
-        base_threshold: float
-            Initial value for base threshold τ₀
-        beta: float
-            Initial value for sensitivity parameter β
-        uncertainty_reg: float
-            Weight for uncertainty regularization in loss function
-        reg_coefficient: float
-            Regularization coefficient for beta and threshold
-        margin_weight: float
-            Weight for margin loss
         kl_weight: float
             Weight for KL divergence in ELBO
         num_samples: int
             Number of samples to draw from the posterior during training
-        gating_enabled: bool
-            Whether to use the gating mechanism
+        prior_pi: float
+            Prior probability for the slab component (sparsity control)
+        prior_sigma: float
+            Standard deviation for the slab component
+        temperature: float
+            Temperature parameter for Gumbel-Softmax sampling
         """
         super().__init__()
 
         self.feature_dim = feature_dim
         self.blockwise = blockwise
-        self.uncertainty_reg = uncertainty_reg
-        self.reg_coefficient = reg_coefficient
-        self.margin_weight = margin_weight
         self.kl_weight = kl_weight
         self.num_samples = num_samples
-        self.gating_enabled = gating_enabled
-
-        # Initialize learnable gating parameters
-        self.log_base_threshold = nn.Parameter(torch.tensor([math.log(max(base_threshold, 1e-5))], dtype=torch.float))
-        self.log_beta = nn.Parameter(torch.tensor([math.log(max(beta * 0.95, 1e-5))], dtype=torch.float))
-
-        # Register buffers for monitoring
-        self.register_buffer('initial_base_threshold', torch.tensor([base_threshold], dtype=torch.float))
-        self.register_buffer('initial_beta', torch.tensor([beta], dtype=torch.float))
+        self.prior_pi = prior_pi
+        self.prior_sigma = prior_sigma
+        self.temperature = temperature
 
         # Handle task vectors input
         if isinstance(task_vectors, int):
@@ -84,14 +66,16 @@ class VariationalMetaNet(nn.Module):
         # Default block number (will be determined dynamically during forward pass)
         self.num_blocks = 96  # Uses a large default value (safe for most ViT models)
 
-        # Initialize networks for mean and log_variance prediction
+        # Initialize networks for mean, log_variance, and inclusion probability prediction
         if blockwise:
             # Create networks with larger output dimensions to handle various block counts
             self.mean_net = self._build_inference_network(feature_dim, self.num_task_vectors * self.num_blocks)
             self.logvar_net = self._build_inference_network(feature_dim, self.num_task_vectors * self.num_blocks)
+            self.logit_net = self._build_inference_network(feature_dim, self.num_task_vectors * self.num_blocks)
         else:
             self.mean_net = self._build_inference_network(feature_dim, self.num_task_vectors)
             self.logvar_net = self._build_inference_network(feature_dim, self.num_task_vectors)
+            self.logit_net = self._build_inference_network(feature_dim, self.num_task_vectors)
 
         # For feature-based transformation
         self.task_features = nn.ParameterList([
@@ -106,19 +90,17 @@ class VariationalMetaNet(nn.Module):
         # Storage for computed values during forward pass
         self.last_means = None
         self.last_logvars = None
+        self.last_logits = None
         self.last_samples = None
-        self.last_uncertainties = None
-        self.last_gated_samples = None
-        self.last_thresholds = None
-        self.last_binary_mask = None
+        self.last_binary_indicators = None
 
         # Tracking variables
         self._forward_count = 0
-        self._reg_loss_count = 0
+        self._kl_loss_count = 0
         self.training_mode = True
 
     def _build_inference_network(self, input_dim, output_dim):
-        """Build inference network for mean or variance prediction.
+        """Build inference network for posterior parameter prediction.
 
         Parameters:
         ----------
@@ -148,44 +130,8 @@ class VariationalMetaNet(nn.Module):
 
         return network
 
-    @property
-    def base_threshold(self):
-        """Get the actual base threshold value (always positive)."""
-        return torch.exp(self.log_base_threshold)
-
-    @property
-    def beta(self):
-        """Get the actual beta value (always positive)."""
-        return torch.exp(self.log_beta)
-
-    def compute_uncertainty(self, means, logvars):
-        """Compute uncertainty based on variational posterior.
-
-        Parameters:
-        ----------
-        means: Tensor [batch_size, num_coeffs]
-            Mean parameters of the posterior
-        logvars: Tensor [batch_size, num_coeffs]
-            Log variance parameters of the posterior
-
-        Returns:
-        ----------
-        uncertainties: Tensor [batch_size, num_coeffs]
-            Uncertainty scores for each coefficient
-        """
-        # Convert log variance to standard deviation
-        stdevs = torch.exp(0.5 * logvars)
-
-        # Coefficient of variation (relative uncertainty)
-        rel_uncertainty = stdevs / (torch.abs(means) + 1e-8)
-
-        # Scale to [0, 1] range
-        normalized_uncertainty = torch.tanh(rel_uncertainty)
-
-        return normalized_uncertainty
-
-    def reparameterize(self, mean, logvar):
-        """Sample from the variational posterior using reparameterization trick.
+    def reparameterize_gaussian(self, mean, logvar):
+        """Sample from Gaussian posterior using reparameterization trick.
 
         Parameters:
         ----------
@@ -197,105 +143,40 @@ class VariationalMetaNet(nn.Module):
         Returns:
         ----------
         samples: Tensor
-            Samples from the posterior distribution
+            Samples from the Gaussian distribution
         """
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mean + eps * std
 
-    def adaptive_gating(self, samples, uncertainties):
-        """Apply adaptive thresholding based on uncertainty.
+    def reparameterize_binary(self, logits, tau=1.0, hard=False):
+        """Sample binary values using Gumbel-Softmax trick.
 
         Parameters:
         ----------
-        samples: Tensor
-            Samples from the posterior distribution
-        uncertainties: Tensor
-            Uncertainty scores for each coefficient
+        logits: Tensor
+            Logits for binary distribution
+        tau: float
+            Temperature parameter for Gumbel-Softmax
+        hard: bool
+            Whether to use hard sampling in forward pass
 
         Returns:
         ----------
-        gated_samples: Tensor
-            Samples after applying adaptive gating
-        thresholds: Tensor
-            Computed thresholds for each coefficient
+        samples: Tensor
+            Binary samples (or soft approximations)
         """
-        # Get base_threshold and beta from log-parameterized versions
-        base_threshold = self.base_threshold
-        beta_val = self.beta
+        # Create binary logits (for 0 and 1)
+        logits_expanded = torch.stack([torch.zeros_like(logits), logits], dim=-1)
 
-        # Compute adaptive thresholds - higher uncertainty means higher threshold
-        thresholds = base_threshold * (1.0 + beta_val * uncertainties)
+        # Apply Gumbel-Softmax
+        y_soft = F.gumbel_softmax(logits_expanded, tau=tau, hard=hard, dim=-1)
 
-        # Add coefficient-specific dynamic adjustment based on distribution statistics
-        if self.training and hasattr(self, 'last_means') and self.last_means is not None:
-            # Get batch size and structure from current samples
-            batch_size, num_vectors, num_blocks = samples.shape
-
-            # Dynamically update num_blocks based on current input
-            if self.blockwise and hasattr(self, 'num_blocks'):
-                self.num_blocks = num_blocks
-
-            # Ensure dimensions match by reshaping to match threshold dimensions
-            if self.blockwise:
-                # Reshape means to match current shape (accounting for potential dimension mismatch)
-                try:
-                    # Try to reshape using the current structure
-                    reshaped_means = self.last_means.reshape(-1, num_vectors, num_blocks)
-                except RuntimeError:
-                    # If reshape fails, use a dimension-agnostic approach
-                    means_flat = self.last_means.reshape(self.last_means.size(0), -1)
-                    means_per_vector = means_flat.size(1) // num_vectors
-                    if means_per_vector >= num_blocks:
-                        # Truncate extra dimensions
-                        reshaped_means = means_flat[:, :num_vectors*num_blocks].reshape(-1, num_vectors, num_blocks)
-                    else:
-                        # Pad with zeros to match dimensions
-                        padding = torch.zeros(means_flat.size(0), num_vectors*num_blocks - means_flat.size(1),
-                                             device=means_flat.device)
-                        padded_means = torch.cat([means_flat, padding], dim=1)
-                        reshaped_means = padded_means.reshape(-1, num_vectors, num_blocks)
-
-                # Calculate statistics correctly with the properly reshaped tensor
-                mean_abs = torch.mean(torch.abs(reshaped_means), dim=0, keepdim=True)
-                std_abs = torch.std(torch.abs(reshaped_means), dim=0, keepdim=True) + 1e-6
-
-                # Ensure broadcasting works correctly
-                if mean_abs.shape != thresholds.shape:
-                    mean_abs = mean_abs.expand_as(thresholds)
-                    std_abs = std_abs.expand_as(thresholds)
-            else:
-                # For non-blockwise, simpler reshape is sufficient
-                mean_abs = torch.mean(torch.abs(self.last_means), dim=0, keepdim=True)
-                std_abs = torch.std(torch.abs(self.last_means), dim=0, keepdim=True) + 1e-6
-
-            # Apply scaled adjustment based on global statistics (with dimension check)
-            if mean_abs.shape == thresholds.shape:
-                thresholds = thresholds * (1.0 + 0.1 * (std_abs / (mean_abs + 1e-8)))
-
-        # Gradually anneal thresholds during early training
-        if hasattr(self, '_forward_count'):
-            early_training_factor = max(1.0, 2.0 - self._forward_count / 1000.0)
-            thresholds = thresholds * early_training_factor
-
-        # Apply gating - use a smoother transition for better gradients
-        if self.training:
-            # Differentiable approximation during training
-            sigmoid_scale = 20.0  # Steepness of the sigmoid
-            gating_mask = torch.sigmoid(sigmoid_scale * (torch.abs(samples) - thresholds))
-            gated_samples = samples * gating_mask
-
-            # Store actual binary mask for statistics
-            self.last_binary_mask = (torch.abs(samples) >= thresholds).float().detach()
-        else:
-            # Hard gating during evaluation for exact sparsity
-            gating_mask = (torch.abs(samples) >= thresholds).float()
-            gated_samples = samples * gating_mask
-
-        return gated_samples, thresholds
+        # Return probability of being 1
+        return y_soft[..., 1]
 
     def forward(self, features, num_samples=None):
-        """Forward pass with variational inference.
+        """Forward pass with Spike-and-Slab variational inference.
 
         Parameters:
         ----------
@@ -314,15 +195,18 @@ class VariationalMetaNet(nn.Module):
         if num_samples is None:
             num_samples = self.num_samples if self.training else 1
 
-        # Generate mean and log variance parameters
+        # Generate mean, log variance, and inclusion logit parameters
         means = self.mean_net(features)
         logvars = self.logvar_net(features)
+        logits = self.logit_net(features)
 
         # Constrain log variance for numerical stability
         logvars = torch.clamp(logvars, min=-8.0, max=2.0)
 
+        # Store for KL calculation
         self.last_means = means.detach()
         self.last_logvars = logvars.detach()
+        self.last_logits = logits.detach()
 
         # Determine blocks dynamically from network output
         if self.blockwise:
@@ -333,37 +217,41 @@ class VariationalMetaNet(nn.Module):
             # Reshape parameters using the inferred block count
             means = means[:, :self.num_task_vectors*self.num_blocks].reshape(-1, self.num_task_vectors, self.num_blocks)
             logvars = logvars[:, :self.num_task_vectors*self.num_blocks].reshape(-1, self.num_task_vectors, self.num_blocks)
+            logits = logits[:, :self.num_task_vectors*self.num_blocks].reshape(-1, self.num_task_vectors, self.num_blocks)
         else:
             means = means.reshape(-1, self.num_task_vectors, 1)
             logvars = logvars.reshape(-1, self.num_task_vectors, 1)
-
-        # Compute uncertainty for gating
-        uncertainties = self.compute_uncertainty(means, logvars)
-        self.last_uncertainties = uncertainties.detach()
+            logits = logits.reshape(-1, self.num_task_vectors, 1)
 
         # Multiple samples if requested (MC sampling)
         batch_size = features.size(0)
         all_outputs = []
+        all_binary_indicators = []
 
         for sample_idx in range(num_samples):
-            # Sample from the variational posterior using reparameterization
-            samples = self.reparameterize(means, logvars)
+            # Sample from the Gaussian part of posterior using reparameterization
+            gaussian_samples = self.reparameterize_gaussian(means, logvars)
 
-            # Apply adaptive gating if enabled
-            if self.gating_enabled:
-                gated_samples, thresholds = self.adaptive_gating(samples, uncertainties)
-                self.last_gated_samples = gated_samples.detach()
-                self.last_thresholds = thresholds.detach()
-            else:
-                # If gating is disabled, use samples directly
-                gated_samples = samples
-                self.last_gated_samples = samples.detach()
+            # Sample binary indicators using Gumbel-Softmax
+            # Lower temperature during inference for more discrete samples
+            current_temp = self.temperature if self.training else self.temperature * 0.1
+            binary_indicators = self.reparameterize_binary(logits, tau=current_temp, hard=not self.training)
+
+            # Store binary indicators for sparsity statistics
+            all_binary_indicators.append(binary_indicators.detach())
+
+            # Apply binary mask to create spike-and-slab samples
+            samples = gaussian_samples * binary_indicators
+
+            # Store samples for potential later use
+            self.last_samples = samples.detach()
+            self.last_binary_indicators = binary_indicators.detach()
 
             # Average across blocks for blockwise mode
             if self.blockwise:
-                coefficients = gated_samples.mean(dim=2)
+                coefficients = samples.mean(dim=2)
             else:
-                coefficients = gated_samples.squeeze(2)
+                coefficients = samples.squeeze(2)
 
             # Apply task vectors directly in feature space
             sample_outputs = []
@@ -392,211 +280,102 @@ class VariationalMetaNet(nn.Module):
         # Average predictions from multiple samples
         if num_samples > 1:
             output = torch.stack(all_outputs).mean(dim=0)
+            self.last_binary_indicators = torch.stack(all_binary_indicators).mean(dim=0)
         else:
             output = all_outputs[0]
+            self.last_binary_indicators = all_binary_indicators[0]
 
         return output
 
     def kl_divergence_loss(self):
-        """Compute KL divergence loss for the variational posterior.
+        """Compute KL divergence loss for the Spike-and-Slab variational posterior.
 
         Returns:
         ----------
         loss: Tensor
             KL divergence loss component of ELBO
         """
-        if self.last_means is None or self.last_logvars is None:
-            return torch.tensor(0.0, device=self.log_base_threshold.device)
+        self._kl_loss_count += 1
 
-        # Reshape if needed
+        if self.last_means is None or self.last_logvars is None or self.last_logits is None:
+            return torch.tensor(0.0, device=self.last_means.device if self.last_means is not None else 'cpu')
+
+        # Reshape parameters for easier calculation
         means = self.last_means
         logvars = self.last_logvars
+        logits = self.last_logits
 
-        # Prior parameters (standard Gaussian with spike)
-        prior_mean = torch.zeros_like(means)
-        prior_logvar = torch.zeros_like(logvars)
+        # Calculate posterior inclusion probability q(γ=1|x)
+        q_gamma = torch.sigmoid(logits)
 
-        # Standard KL divergence between two Gaussians
-        # KL(q||p) = 0.5 * (log(σ²_p/σ²_q) + (σ²_q + (μ_q - μ_p)²)/σ²_p - 1)
-        kl_div = 0.5 * (
-            prior_logvar - logvars +
-            (torch.exp(logvars) + (means - prior_mean).pow(2)) / torch.exp(prior_logvar) -
-            1.0
+        # KL for the Bernoulli part (binary indicators)
+        kl_bernoulli = q_gamma * torch.log(q_gamma / self.prior_pi + 1e-10) + \
+                       (1 - q_gamma) * torch.log((1 - q_gamma) / (1 - self.prior_pi) + 1e-10)
+
+        # KL for the Gaussian part (only matters when γ=1)
+        # KL(q(w|γ=1)||p(w|γ=1)) = 0.5 * [log(σ²_p/σ²_q) + (σ²_q + μ²_q)/σ²_p - 1]
+        kl_gaussian = 0.5 * (
+            -logvars +
+            (torch.exp(logvars) + means.pow(2)) / (self.prior_sigma**2) -
+            1 +
+            2 * math.log(self.prior_sigma)
         )
 
-        # If gating is enabled, account for Spike-and-Slab prior
-        if self.gating_enabled and hasattr(self, 'last_binary_mask'):
-            # Get proportion of non-zeroed coefficients (slab component)
-            slab_proportion = self.last_binary_mask.mean()
+        # Total KL is the sum of Bernoulli KL and expected Gaussian KL (weighted by inclusion probability)
+        kl_total = kl_bernoulli + q_gamma * kl_gaussian
 
-            # Mixture weight for the spike component
-            pi = 0.5  # Default 50% spike probability in prior
+        return kl_total.mean() * self.kl_weight
 
-            # Adjust KL divergence for spike component
-            # log(q(z)/p(z)) where p(z) is a mixture
-            spike_penalty = -torch.log(pi + (1 - pi) * torch.exp(-kl_div) + 1e-10)
-
-            # Apply penalty more heavily to near-threshold values
-            if hasattr(self, 'last_thresholds'):
-                threshold_distance = torch.abs(torch.abs(means) - self.last_thresholds.mean())
-                threshold_factor = torch.exp(-5.0 * threshold_distance) + 0.5
-                spike_penalty = spike_penalty * threshold_factor
-
-            # Final KL with spike component
-            kl_div = kl_div * slab_proportion + spike_penalty * (1 - slab_proportion)
-
-        return kl_div.mean() * self.kl_weight
-
-    def margin_loss(self):
-        """Compute margin loss to encourage decisive gating.
-
-        Returns:
-        ----------
-        loss: Tensor
-            Margin loss to discourage values near threshold
-        """
-        if not self.gating_enabled or self.last_means is None or self.last_thresholds is None:
-            return torch.tensor(0.0, device=self.log_base_threshold.device)
-
-        # Calculate average threshold
-        avg_threshold = self.last_thresholds.mean()
-
-        # Define margin width (20% of threshold)
-        margin_width = avg_threshold * 0.2
-
-        # Calculate distance from threshold
-        threshold_distance = torch.abs(torch.abs(self.last_means) - avg_threshold)
-
-        # Penalty for being within margin
-        in_margin = (threshold_distance < margin_width).float()
-
-        # Higher penalty for values very close to threshold
-        penalty_factor = (1.0 - threshold_distance / (margin_width + 1e-8)) * in_margin
-
-        return (penalty_factor * self.margin_weight).mean()
-
-    def parameter_exploration_loss(self):
-        """Compute loss to encourage parameter exploration.
-
-        Returns:
-        ----------
-        loss: Tensor
-            Regularization loss to encourage parameter exploration
-        """
-        if not self.gating_enabled:
-            return torch.tensor(0.0, device=self.log_base_threshold.device)
-
-        # Get initial values
-        init_beta = self.initial_beta.item()
-        init_threshold = self.initial_base_threshold.item()
-
-        # Calculate the distance from initial values
-        beta_dist = torch.abs(self.beta - init_beta)
-        threshold_dist = torch.abs(self.base_threshold - init_threshold)
-
-        # Encourage parameters to move away from initialization
-        beta_reg = -torch.log(beta_dist.clamp(min=1e-5)) * self.reg_coefficient
-        threshold_reg = -torch.log(threshold_dist.clamp(min=1e-5)) * self.reg_coefficient
-
-        return beta_reg + threshold_reg
-
-    def uncertainty_regularization_loss(self):
-        """Compute complete regularization loss.
-
-        Returns:
-        ----------
-        loss: Tensor
-            Combined regularization losses
-        """
-        self._reg_loss_count += 1
-
-        # Combine all regularization components
-        kl_loss = self.kl_divergence_loss()
-        margin_loss = self.margin_loss()
-        param_loss = self.parameter_exploration_loss()
-
-        # Uncertainty regularization of active coefficients
-        uncertainty_loss = torch.tensor(0.0, device=self.log_base_threshold.device)
-
-        if self.gating_enabled and self.last_uncertainties is not None and self.last_gated_samples is not None:
-            # Create mask for active (non-gated) coefficients
-            active_mask = (self.last_gated_samples != 0).float()
-
-            # Reshape for averaging if blockwise
-            if self.blockwise:
-                active_mask = active_mask.mean(dim=2)
-                uncertainties = self.last_uncertainties.mean(dim=2)
-            else:
-                active_mask = active_mask.squeeze(2)
-                uncertainties = self.last_uncertainties.squeeze(2)
-
-            # Compute weighted uncertainty loss - only penalize non-zero coefficients
-            uncertainty_loss = torch.sum(active_mask * uncertainties) * self.uncertainty_reg
-
-        total_loss = kl_loss + margin_loss + param_loss + uncertainty_loss
-
-        return total_loss
-
-    def get_gating_stats(self):
-        """Get statistics about the gating process for monitoring.
+    def get_sparsity_stats(self):
+        """Get sparsity statistics for monitoring.
 
         Returns:
         ----------
         stats: dict
-            Dictionary with gating statistics
+            Dictionary with sparsity statistics
         """
-        # Handle evaluation mode differently
-        if not self.training_mode or not self.gating_enabled:
+        if self.last_binary_indicators is None:
             return {
-                "gating_ratio": 0.0,
-                "avg_threshold": self.base_threshold.item(),
-                "avg_uncertainty": 0.0,
-                "base_threshold": self.base_threshold.item(),
-                "beta": self.beta.item(),
-                "log_base_threshold": self.log_base_threshold.item(),
-                "log_beta": self.log_beta.item(),
-                "predictive_variance": 0.0,
+                "sparsity_ratio": 0.0,
+                "active_coefficient_ratio": 0.0,
+                "posterior_inclusion_prob": 0.0,
+                "prior_inclusion_prob": self.prior_pi,
+                "prior_sigma": self.prior_sigma,
+                "kl_weight": self.kl_weight,
+                "temperature": self.temperature,
                 "forward_count": self._forward_count if hasattr(self, '_forward_count') else 0,
-                "reg_loss_count": self._reg_loss_count if hasattr(self, '_reg_loss_count') else 0,
+                "kl_loss_count": self._kl_loss_count if hasattr(self, '_kl_loss_count') else 0,
             }
 
-        # Return training mode stats if available
-        if self.last_gated_samples is None:
-            return {
-                "gating_ratio": 0.0,
-                "avg_threshold": self.base_threshold.item(),
-                "avg_uncertainty": 0.0,
-                "base_threshold": self.base_threshold.item(),
-                "beta": self.beta.item(),
-                "log_base_threshold": self.log_base_threshold.item(),
-                "log_beta": self.log_beta.item(),
-                "predictive_variance": 0.0,
-                "forward_count": self._forward_count if hasattr(self, '_forward_count') else 0,
-                "reg_loss_count": self._reg_loss_count if hasattr(self, '_reg_loss_count') else 0,
-            }
+        # Calculate sparsity ratio (percentage of zeroed coefficients)
+        if hasattr(self, 'last_binary_indicators'):
+            active_indicators = (self.last_binary_indicators > 0.5).float()
+            sparsity_ratio = 1.0 - active_indicators.mean().item()
 
-        # Calculate gating statistics
-        total_coeffs = self.last_gated_samples.numel()
-        nonzero_coeffs = (self.last_gated_samples != 0).sum().item()
-        gating_ratio = nonzero_coeffs / total_coeffs if total_coeffs > 0 else 0.0
+            # Also calculate average value of continuous indicators
+            posterior_inclusion_prob = self.last_binary_indicators.mean().item()
+        else:
+            sparsity_ratio = 0.0
+            posterior_inclusion_prob = 0.0
 
-        avg_threshold = self.last_thresholds.mean().item() if self.last_thresholds is not None else 0.0
-        avg_uncertainty = self.last_uncertainties.mean().item() if self.last_uncertainties is not None else 0.0
+        # For samples, calculate ratio of truly non-zero coefficients
+        if hasattr(self, 'last_samples'):
+            non_zero_coeffs = (torch.abs(self.last_samples) > 1e-6).float()
+            active_coefficient_ratio = non_zero_coeffs.mean().item()
+        else:
+            active_coefficient_ratio = 0.0
 
-        # Calculate average predictive variance (derived from logvars)
-        predictive_variance = torch.exp(self.last_logvars).mean().item() if self.last_logvars is not None else 0.0
-
+        # Return comprehensive stats
         return {
-            "gating_ratio": gating_ratio,
-            "avg_threshold": avg_threshold,
-            "avg_uncertainty": avg_uncertainty,
-            "base_threshold": self.base_threshold.item(),
-            "beta": self.beta.item(),
-            "log_base_threshold": self.log_base_threshold.item(),
-            "log_beta": self.log_beta.item(),
-            "predictive_variance": predictive_variance,
+            "sparsity_ratio": sparsity_ratio,
+            "active_coefficient_ratio": active_coefficient_ratio,
+            "posterior_inclusion_prob": posterior_inclusion_prob,
+            "prior_inclusion_prob": self.prior_pi,
+            "prior_sigma": self.prior_sigma,
+            "kl_weight": self.kl_weight,
+            "temperature": self.temperature,
             "forward_count": self._forward_count if hasattr(self, '_forward_count') else 0,
-            "reg_loss_count": self._reg_loss_count if hasattr(self, '_reg_loss_count') else 0,
+            "kl_loss_count": self._kl_loss_count if hasattr(self, '_kl_loss_count') else 0,
         }
 
     def get_posterior_stats(self, features):
@@ -613,15 +392,19 @@ class VariationalMetaNet(nn.Module):
             Dictionary with posterior distribution statistics
         """
         with torch.no_grad():
-            # Generate mean and log variance parameters
+            # Generate posterior parameters
             means = self.mean_net(features)
             logvars = self.logvar_net(features)
+            logits = self.logit_net(features)
 
             # Constrain log variance for numerical stability
             logvars = torch.clamp(logvars, min=-8.0, max=2.0)
 
             # Convert to standard deviation for easier interpretation
             stdevs = torch.exp(0.5 * logvars)
+
+            # Calculate inclusion probabilities
+            inclusion_probs = torch.sigmoid(logits)
 
             # Handle blockwise reshape the same way as in forward()
             if self.blockwise:
@@ -634,9 +417,7 @@ class VariationalMetaNet(nn.Module):
                 means_shaped = means[:, :self.num_task_vectors*used_blocks].reshape(-1, self.num_task_vectors, used_blocks)
                 logvars_shaped = logvars[:, :self.num_task_vectors*used_blocks].reshape(-1, self.num_task_vectors, used_blocks)
                 stdevs_shaped = stdevs[:, :self.num_task_vectors*used_blocks].reshape(-1, self.num_task_vectors, used_blocks)
-
-                # Compute uncertainty on shaped tensors
-                uncertainties = self.compute_uncertainty(means_shaped, logvars_shaped)
+                inclusion_probs_shaped = inclusion_probs[:, :self.num_task_vectors*used_blocks].reshape(-1, self.num_task_vectors, used_blocks)
 
                 # Compute coefficient of variation as a relative uncertainty measure
                 coeff_variation = stdevs_shaped / (torch.abs(means_shaped) + 1e-8)
@@ -645,35 +426,32 @@ class VariationalMetaNet(nn.Module):
                 means_shaped = means.reshape(-1, self.num_task_vectors, 1)
                 logvars_shaped = logvars.reshape(-1, self.num_task_vectors, 1)
                 stdevs_shaped = stdevs.reshape(-1, self.num_task_vectors, 1)
-
-                # Compute uncertainty
-                uncertainties = self.compute_uncertainty(means_shaped, logvars_shaped)
+                inclusion_probs_shaped = inclusion_probs.reshape(-1, self.num_task_vectors, 1)
 
                 # Compute coefficient of variation
                 coeff_variation = stdevs_shaped / (torch.abs(means_shaped) + 1e-8)
 
-            # Gating probabilities
-            if self.gating_enabled:
-                base_threshold = self.base_threshold
-                beta_val = self.beta
+            # Extract samples for visualization
+            # Sample gaussian part
+            gaussian_samples = self.reparameterize_gaussian(means_shaped, logvars_shaped)
 
-                thresholds = base_threshold * (1.0 + beta_val * uncertainties)
+            # Sample binary indicators (use hard=True for visualization)
+            binary_indicators = self.reparameterize_binary(
+                logits.reshape_as(means_shaped),
+                tau=self.temperature * 0.1,
+                hard=True
+            )
 
-                # Probability of coefficient being active
-                active_probs = 1.0 - torch.distributions.Normal(0, 1).cdf(
-                    (thresholds - torch.abs(means_shaped)) / (stdevs_shaped + 1e-8)
-                )
-            else:
-                thresholds = torch.zeros_like(means_shaped)
-                active_probs = torch.ones_like(means_shaped)
+            # Apply binary mask to create spike-and-slab samples
+            samples = gaussian_samples * binary_indicators
 
             return {
                 "means": means_shaped.detach().cpu(),
                 "stdevs": stdevs_shaped.detach().cpu(),
                 "coeff_var": coeff_variation.detach().cpu(),
-                "uncertainties": uncertainties.detach().cpu(),
-                "thresholds": thresholds.detach().cpu(),
-                "active_probs": active_probs.detach().cpu(),
+                "inclusion_probs": inclusion_probs_shaped.detach().cpu(),
+                "binary_indicators": binary_indicators.detach().cpu(),
+                "samples": samples.detach().cpu(),
             }
 
     def monte_carlo_predictions(self, features, classifier, num_samples=10):
@@ -698,10 +476,15 @@ class VariationalMetaNet(nn.Module):
         with torch.no_grad():
             # Get predictions for multiple samples
             all_logits = []
+            all_binary_indicators = []
 
             for _ in range(num_samples):
                 # Forward pass with a single sample
                 transformed_features = self.forward(features, num_samples=1)
+
+                # Store binary indicators for this sample
+                if hasattr(self, 'last_binary_indicators'):
+                    all_binary_indicators.append(self.last_binary_indicators)
 
                 # Get classifier predictions
                 logits = classifier(transformed_features)
@@ -709,6 +492,15 @@ class VariationalMetaNet(nn.Module):
 
             # Stack predictions
             all_logits = torch.stack(all_logits, dim=0)  # [num_samples, batch_size, num_classes]
+
+            # Average binary indicators across samples if available
+            if all_binary_indicators:
+                binary_indicators = torch.stack(all_binary_indicators, dim=0)
+                avg_binary_indicators = binary_indicators.mean(dim=0)
+                sparsity_ratio = 1.0 - (binary_indicators > 0.5).float().mean().item()
+            else:
+                avg_binary_indicators = None
+                sparsity_ratio = 0.0
 
             # Calculate mean prediction
             mean_logits = all_logits.mean(dim=0)  # [batch_size, num_classes]
@@ -728,11 +520,17 @@ class VariationalMetaNet(nn.Module):
             # Get predicted class
             _, predicted = mean_logits.max(dim=1)
 
-            return {
+            result = {
                 "predictions": predicted.cpu(),
                 "mean_probs": mean_probs.cpu(),
                 "predictive_entropy": predictive_entropy.cpu(),
                 "aleatoric_uncertainty": aleatoric_uncertainty.cpu(),
                 "epistemic_uncertainty": epistemic_uncertainty.cpu(),
                 "all_probs": all_probs.cpu(),
+                "sparsity_ratio": sparsity_ratio,
             }
+
+            if avg_binary_indicators is not None:
+                result["binary_indicators"] = avg_binary_indicators.cpu()
+
+            return result
