@@ -34,7 +34,7 @@ from src.args import parse_arguments
 args = parse_arguments()
 
 # Add variational-specific arguments
-args.kl_weight = 0.1  # Weight for KL divergence in ELBO
+args.kl_weight = args.kl_weight  # Weight for KL divergence in ELBO
 args.num_samples = 5  # Number of samples to draw from posterior during training
 args.visualize_posterior = True  # Whether to visualize posterior distributions
 args.prior_pi = 0.5  # Prior inclusion probability
@@ -527,7 +527,7 @@ def train_with_variational(rank, args):
             ddp_model = torch.nn.parallel.DistributedDataParallel(
                 model,
                 device_ids=[args.rank],
-                find_unused_parameters=True
+                find_unused_parameters=False
             )
 
             # Setup classifier layer
@@ -790,6 +790,22 @@ def train_with_variational(rank, args):
                     'prior_sigma': float(args.prior_sigma),
                     'temperature': float(args.temperature)
                 }
+
+                def convert_numpy_types(obj):
+                    if isinstance(obj, np.float32) or isinstance(obj, np.float64):
+                        return float(obj)
+                    elif isinstance(obj, np.int32) or isinstance(obj, np.int64):
+                        return int(obj)
+                    elif isinstance(obj, np.ndarray):
+                        return obj.tolist()
+                    elif isinstance(obj, list):
+                        return [convert_numpy_types(item) for item in obj]
+                    elif isinstance(obj, dict):
+                        return {key: convert_numpy_types(value) for key, value in obj.items()}
+                    else:
+                        return obj
+
+                history = convert_numpy_types(history)
 
                 history_path = os.path.join(save_dir, "spike_and_slab_training_history.json")
 

@@ -24,7 +24,7 @@ from src.args import parse_arguments
 args = parse_arguments()
 
 # Add variational-specific arguments
-args.num_eval_samples = 30  # Number of MC samples for evaluation
+args.num_eval_samples = 20  # Number of MC samples for evaluation
 args.save_uncertainty = True  # Whether to save reliability diagram
 args.detailed_analysis = True  # Enable detailed analysis
 args.temperature = 0.1  # Temperature for Gumbel-Softmax during evaluation

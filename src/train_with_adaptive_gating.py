@@ -956,6 +956,13 @@ def train_with_adaptive_gating(rank, args):
 
             model = model.to(rank)
 
+            original_lr = args.lr
+
+            if dataset_name in ["SUN397", "SVHN"]:
+                args.lr = args.lr * 0.5
+                if is_main_process():
+                    print(f"Adjusted learning rate for {dataset_name}: {args.lr} (0.5x original)")
+
             data_loader = dataset.train_loader
             num_batches = len(data_loader)
 
@@ -1424,6 +1431,10 @@ def train_with_adaptive_gating(rank, args):
                 print(f"Error processing dataset {dataset_name}: {e}")
                 traceback.print_exc()
         finally:
+            # 恢复原始学习率以供下一个数据集使用
+            if 'original_lr' in locals():
+                args.lr = original_lr
+
             # Clean up dataset resources
             cleanup_resources(dataset)
             torch.cuda.empty_cache()

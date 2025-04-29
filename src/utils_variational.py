@@ -278,8 +278,8 @@ def visualize_posterior_distribution(posterior_stats, num_display=5, num_task_ve
     means = posterior_stats["means"]
     stdevs = posterior_stats["stdevs"]
     coeff_var = posterior_stats["coeff_var"]
-    thresholds = posterior_stats["thresholds"]
-    active_probs = posterior_stats["active_probs"]
+    inclusion_probs = posterior_stats["inclusion_probs"]
+    binary_indicators = posterior_stats.get("binary_indicators", None)
 
     batch_size = means.shape[0]
     num_display = min(num_display, batch_size)
@@ -292,8 +292,11 @@ def visualize_posterior_distribution(posterior_stats, num_display=5, num_task_ve
             # Reshape for blockwise visualization
             sample_means = means[i].reshape(num_task_vectors, -1)
             sample_stdevs = stdevs[i].reshape(num_task_vectors, -1)
-            sample_thresholds = thresholds[i].reshape(num_task_vectors, -1)
-            sample_active_probs = active_probs[i].reshape(num_task_vectors, -1)
+            sample_inclusion_probs = inclusion_probs[i].reshape(num_task_vectors, -1)
+            if binary_indicators is not None:
+                sample_binary_indicators = binary_indicators[i].reshape(num_task_vectors, -1)
+            else:
+                sample_binary_indicators = None
 
             fig, axes = plt.subplots(2, 2, figsize=(15, 10))
             fig.suptitle(f"Sample {i + 1} Posterior Distribution")
@@ -312,16 +315,21 @@ def visualize_posterior_distribution(posterior_stats, num_display=5, num_task_ve
             axes[0, 1].set_xlabel("Block")
             fig.colorbar(im1, ax=axes[0, 1])
 
-            # Plot thresholds
-            im2 = axes[1, 0].imshow(sample_thresholds, aspect='auto', cmap='plasma')
-            axes[1, 0].set_title("Gating Thresholds")
+            # Plot inclusion probabilities
+            im2 = axes[1, 0].imshow(sample_inclusion_probs, aspect='auto', cmap='plasma')
+            axes[1, 0].set_title("Inclusion Probabilities")
             axes[1, 0].set_ylabel("Task Vector")
             axes[1, 0].set_xlabel("Block")
             fig.colorbar(im2, ax=axes[1, 0])
 
-            # Plot activation probabilities
-            im3 = axes[1, 1].imshow(sample_active_probs, aspect='auto', cmap='magma')
-            axes[1, 1].set_title("Activation Probabilities")
+            # Plot binary indicators or coefficient of variation
+            if sample_binary_indicators is not None:
+                im3 = axes[1, 1].imshow(sample_binary_indicators, aspect='auto', cmap='magma')
+                axes[1, 1].set_title("Binary Indicators")
+            else:
+                sample_coeff_var = coeff_var[i].reshape(num_task_vectors, -1)
+                im3 = axes[1, 1].imshow(sample_coeff_var, aspect='auto', cmap='magma')
+                axes[1, 1].set_title("Coefficient of Variation")
             axes[1, 1].set_ylabel("Task Vector")
             axes[1, 1].set_xlabel("Block")
             fig.colorbar(im3, ax=axes[1, 1])
@@ -345,16 +353,21 @@ def visualize_posterior_distribution(posterior_stats, num_display=5, num_task_ve
             axes[0, 1].set_ylabel("Value")
             axes[0, 1].set_xlabel("Task Vector")
 
-            # Plot thresholds
-            axes[1, 0].bar(x, thresholds[i], alpha=0.7, color='green')
-            axes[1, 0].set_title("Gating Thresholds")
+            # Plot inclusion probabilities
+            axes[1, 0].bar(x, inclusion_probs[i], alpha=0.7, color='green')
+            axes[1, 0].set_title("Inclusion Probabilities")
             axes[1, 0].set_ylabel("Value")
             axes[1, 0].set_xlabel("Task Vector")
 
-            # Plot activation probabilities
-            axes[1, 1].bar(x, active_probs[i], alpha=0.7, color='purple')
-            axes[1, 1].set_title("Activation Probabilities")
-            axes[1, 1].set_ylabel("Probability")
+            # Plot binary indicators if available, otherwise something else
+            if binary_indicators is not None:
+                axes[1, 1].bar(x, binary_indicators[i], alpha=0.7, color='purple')
+                axes[1, 1].set_title("Binary Indicators")
+            else:
+                # Just duplicate inclusion probabilities as a fallback
+                axes[1, 1].bar(x, inclusion_probs[i], alpha=0.7, color='purple')
+                axes[1, 1].set_title("Inclusion Probabilities (duplicate)")
+            axes[1, 1].set_ylabel("Value")
             axes[1, 1].set_xlabel("Task Vector")
 
         plt.tight_layout()
